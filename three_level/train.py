@@ -26,6 +26,8 @@ class ExperimentConfig:
     batch_size: int = 32
     lr: float = 1e-4
     seed: int = 11
+    data_seed: int = 10_000
+    test_seed: int = 30_000
     eval_interval: int = 250
     stage1_updates: int = 1000
     stage2_updates: int = 1500
@@ -53,7 +55,7 @@ class TrainArtifacts:
 def run_method(method: str, cfg: ExperimentConfig) -> TrainArtifacts:
     _set_seed(cfg.seed)
     device = torch.device(cfg.device)
-    train_set = SyntheticCoTDataset(cfg.train_size, seed=10_000 + cfg.seed, sample_demo_count=True)
+    train_set = SyntheticCoTDataset(cfg.train_size, seed=cfg.data_seed, sample_demo_count=True)
     scales = compute_target_scales(train_set)
     model = CausalCoTTransformer().to(device)
 
@@ -262,8 +264,18 @@ def _dual_update(
     thresholds: list[float],
     cfg: ExperimentConfig,
 ) -> torch.Tensor:
-    values = torch.stack([constraint.detach() - constraint.new_tensor(threshold) for constraint, threshold in zip(constraints, thresholds)])
-    return torch.relu((1.0 - cfg.dual_omega) * lambdas + cfg.dual_omega * cfg.dual_nu * values)
+    if cfg.dual_nu <= 0:
+        raise ValueError("dual_nu must be positive")
+    values = torch.stack(
+        [
+            constraint.detach() - constraint.new_tensor(threshold)
+            for constraint, threshold in zip(constraints, thresholds)
+        ]
+    )
+    return torch.relu(
+        (1.0 - cfg.dual_omega) * lambdas
+        + (cfg.dual_omega / cfg.dual_nu) * values
+    )
 
 
 def _make_adam(model: CausalCoTTransformer, cfg: ExperimentConfig) -> torch.optim.Optimizer:
@@ -299,6 +311,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train Section 7 three-level synthetic CoT methods.")
     parser.add_argument("--method", choices=["uniform", "staged", "constrained"], default="constrained")
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--data-seed", type=int, default=10_000)
+    parser.add_argument("--test-seed", type=int, default=30_000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, default=Path("runs/three_level.pt"))
     parser.add_argument("--train-size", type=int, default=8192)
@@ -322,6 +336,8 @@ def main() -> None:
         test_size=args.test_size,
         batch_size=args.batch_size,
         seed=args.seed,
+        data_seed=args.data_seed,
+        test_seed=args.test_seed,
         eval_interval=args.eval_interval,
         stage1_updates=args.stage1_updates,
         stage2_updates=args.stage2_updates,

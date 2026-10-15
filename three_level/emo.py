@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,193 +13,487 @@ from .model import CausalCoTTransformer
 from .objectives import Losses, compute_losses
 
 
-@dataclass(frozen=True)
-class Constraint:
-    objective: str
-    threshold: float
+ResidualBuilder = Callable[[Losses], list[tuple[str, torch.Tensor]]]
 
 
 @dataclass
-class EpigraphResult:
+class EMOResult:
+    """Result of one epigraph oracle, including its best feasible state."""
+
     state: dict[str, torch.Tensor]
     metrics: dict[str, float]
-    cap: float
     feasible: bool
     history: list[dict[str, Any]]
+    last_state: dict[str, torch.Tensor]
+    last_metrics: dict[str, float]
 
 
-def minimize_single_objective(
+def minimize_level1(
     model: CausalCoTTransformer,
     train_set: SyntheticCoTDataset,
     scales: TargetScales,
     *,
-    objective: str,
     updates: int,
     eval_interval: int,
     batch_size: int,
     lr: float,
     device: torch.device | str,
-) -> EpigraphResult:
-    """Stage-1 reference solve: minimize f1 and keep the best attained value."""
+    loader_seed: int,
+) -> EMOResult:
+    """Estimate E1 = min_theta f1(theta), as required by the paper."""
 
-    loader = _cycle(_loader(train_set, batch_size))
-    optimizer = _make_adam(model, lr)
     initial = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
     best = _checkpoint(model, initial)
-    history: list[dict[str, Any]] = [{"update": 0, "active": objective, **initial}]
+    history: list[dict[str, Any]] = [{"oracle": "level1", "update": 0, **initial}]
+    optimizer = _make_adam(model, lr)
+    batches = _cycle(_loader(train_set, batch_size, loader_seed))
 
     for update in range(1, updates + 1):
-        losses = _batch_losses(model, next(loader), scales, device)
-        _adam_step(optimizer, losses.objective(objective))
-        if update % eval_interval == 0 or update == updates:
+        losses = _batch_losses(model, next(batches), scales, device)
+        _adam_step(optimizer, losses.f1)
+        if _should_eval(update, eval_interval, updates):
             metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
-            history.append({"update": update, "active": objective, **metrics})
-            if metrics[objective] < best["metrics"][objective]:
+            history.append({"oracle": "level1", "update": update, **metrics})
+            if metrics["f1"] < best["metrics"]["f1"]:
                 best = _checkpoint(model, metrics)
 
-    return EpigraphResult(
+    model.load_state_dict(best["state"])
+    return EMOResult(
         state=best["state"],
         metrics=best["metrics"],
-        cap=best["metrics"][objective],
         feasible=True,
         history=history,
+        last_state=_clone_state(model),
+        last_metrics=best["metrics"],
     )
 
 
-def solve_epigraph_level(
+def solve_level2_value(
     model: CausalCoTTransformer,
     train_set: SyntheticCoTDataset,
     scales: TargetScales,
     *,
     start_state: dict[str, torch.Tensor],
-    target_objective: str,
-    constraints: list[Constraint],
-    upper_cap: float,
+    e1: float,
+    epsilon: float,
+    upper_hint: float,
     bisection_steps: int,
     inner_updates: int,
-    eval_interval: int,
+    oracle_eval_interval: int,
+    condition_check_interval: int,
     batch_size: int,
     lr: float,
     device: torch.device | str,
-) -> EpigraphResult:
-    """Solve min cap s.t. min_theta max(residuals) <= 0 by bisection.
+    loader_seed: int,
+) -> tuple[EMOResult, float]:
+    """Recursively estimate E2 using the level-2 epigraph problem.
 
-    For a fixed cap, the inner loop follows EMO's switching subgradient update:
-    select the largest residual and update with the corresponding objective.
+    This solves min z2 subject to min_theta max(g1(theta), f2(theta)-z2) <= 0,
+    where g1 = f1 - E1 - epsilon.
     """
 
-    low = 0.0
-    high = max(float(upper_cap), 1e-12)
-    best: dict[str, Any] | None = None
+    def residuals(cap: float) -> ResidualBuilder:
+        return lambda losses: [
+            ("f1", losses.f1 - losses.f1.new_tensor(e1 + epsilon)),
+            ("f2", losses.f2 - losses.f2.new_tensor(cap)),
+        ]
+
+    result, cap = _bisect_single_cap(
+        model,
+        train_set,
+        scales,
+        start_state=start_state,
+        upper_hint=upper_hint,
+        residuals_for_cap=residuals,
+        bisection_steps=bisection_steps,
+        inner_updates=inner_updates,
+        oracle_eval_interval=oracle_eval_interval,
+        condition_check_interval=condition_check_interval,
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+        loader_seed=loader_seed,
+        oracle_name="level2",
+    )
+    if not result.feasible:
+        raise RuntimeError(
+            "EMO level-2 epigraph problem has no feasible z2 within the "
+            "configured search range"
+        )
+    return result, cap
+
+
+def solve_final_nested(
+    model: CausalCoTTransformer,
+    train_set: SyntheticCoTDataset,
+    scales: TargetScales,
+    *,
+    start_state: dict[str, torch.Tensor],
+    e1: float,
+    e2: float,
+    epsilon: float,
+    upper_hint: float,
+    bisection_steps: int,
+    inner_updates: int,
+    oracle_eval_interval: int,
+    condition_check_interval: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device | str,
+    loader_seed: int,
+) -> tuple[EMOResult, float, float]:
+    """Solve the K=3 final EMO problem with nested z1/z2 bisection.
+
+    For fixed z1 and z2, the paper's switching oracle minimizes
+
+        max(g1, g2 - z2, f3 - z1 - z2).
+
+    The inner bisection chooses z2 for a fixed z1. The outer bisection then
+    chooses the smallest feasible z1.
+    """
+
     history: list[dict[str, Any]] = []
+    outer_low = 0.0
+    outer_high = max(float(upper_hint), 1e-8)
+    best: EMOResult | None = None
+    best_z1 = outer_high
+    best_z2 = 0.0
 
-    for bisect_idx in range(bisection_steps):
-        cap = 0.5 * (low + high)
-        model.load_state_dict(start_state)
-        optimizer = _make_adam(model, lr)
-        loader = _cycle(_loader(train_set, batch_size))
-        active_counts = {constraint.objective: 0 for constraint in constraints}
-        active_counts[target_objective] = 0
+    for expansion in range(12):
+        inner_result, inner_z2 = _solve_inner_z2(
+            model,
+            train_set,
+            scales,
+            start_state=start_state,
+            z1=outer_high,
+            e1=e1,
+            e2=e2,
+            epsilon=epsilon,
+            bisection_steps=bisection_steps,
+            inner_updates=inner_updates,
+            oracle_eval_interval=oracle_eval_interval,
+            condition_check_interval=condition_check_interval,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            loader_seed=loader_seed,
+            oracle_name=f"final_z1_upper_{expansion}",
+        )
+        history.extend(inner_result.history)
+        if inner_result.feasible:
+            best = inner_result
+            best_z1 = outer_high
+            best_z2 = inner_z2
+            break
+        outer_high *= 2.0
+    else:
+        raise RuntimeError("EMO could not find a feasible upper bracket for z1")
 
-        for update in range(1, inner_updates + 1):
-            losses = _batch_losses(model, next(loader), scales, device)
-            objective_tensor, active_name, residual_value = select_epigraph_objective(
-                losses,
-                constraints=constraints,
-                target_objective=target_objective,
-                cap=cap,
-            )
-            active_counts[active_name] += 1
-            _adam_step(optimizer, objective_tensor)
-
-            if update % eval_interval == 0 or update == inner_updates:
-                metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
-                history.append(
-                    {
-                        "bisection": bisect_idx,
-                        "cap": cap,
-                        "inner_update": update,
-                        "active": active_name,
-                        "batch_max_residual": residual_value,
-                        **metrics,
-                    }
-                )
-
-        metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
-        residuals = full_residuals(metrics, constraints=constraints, target_objective=target_objective, cap=cap)
-        feasible = max(residuals.values()) <= 0.0
+    for outer_step in range(bisection_steps):
+        z1 = 0.5 * (outer_low + outer_high)
+        inner_result, inner_z2 = _solve_inner_z2(
+            model,
+            train_set,
+            scales,
+            start_state=start_state,
+            z1=z1,
+            e1=e1,
+            e2=e2,
+            epsilon=epsilon,
+            bisection_steps=bisection_steps,
+            inner_updates=inner_updates,
+            oracle_eval_interval=oracle_eval_interval,
+            condition_check_interval=condition_check_interval,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            loader_seed=loader_seed,
+            oracle_name=f"final_z1_{outer_step}",
+        )
+        history.extend(inner_result.history)
         history.append(
             {
-                "bisection": bisect_idx,
-                "cap": cap,
-                "feasible": feasible,
-                "max_residual": max(residuals.values()),
-                "active_counts": active_counts,
-                **{f"residual_{key}": value for key, value in residuals.items()},
-                **metrics,
+                "oracle": "final_outer",
+                "bisection": outer_step,
+                "z1": z1,
+                "z2": inner_z2,
+                "feasible": inner_result.feasible,
+                **inner_result.metrics,
             }
         )
+        if inner_result.feasible:
+            outer_high = z1
+            best = inner_result
+            best_z1 = z1
+            best_z2 = inner_z2
+        else:
+            outer_low = z1
 
-        if feasible:
+    assert best is not None
+    model.load_state_dict(best.state)
+    return (
+        EMOResult(
+            state=best.state,
+            metrics=best.metrics,
+            feasible=True,
+            history=history,
+            last_state=best.last_state,
+            last_metrics=best.last_metrics,
+        ),
+        best_z1,
+        best_z2,
+    )
+
+
+def _solve_inner_z2(
+    model: CausalCoTTransformer,
+    train_set: SyntheticCoTDataset,
+    scales: TargetScales,
+    *,
+    start_state: dict[str, torch.Tensor],
+    z1: float,
+    e1: float,
+    e2: float,
+    epsilon: float,
+    bisection_steps: int,
+    inner_updates: int,
+    oracle_eval_interval: int,
+    condition_check_interval: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device | str,
+    loader_seed: int,
+    oracle_name: str,
+) -> tuple[EMOResult, float]:
+    def residuals(cap: float) -> ResidualBuilder:
+        return lambda losses: [
+            ("f1", losses.f1 - losses.f1.new_tensor(e1 + epsilon)),
+            ("f2", losses.f2 - losses.f2.new_tensor(e2 + epsilon + cap)),
+            ("f3", losses.f3 - losses.f3.new_tensor(z1 + cap)),
+        ]
+
+    start_metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+    result, cap = _bisect_single_cap(
+        model,
+        train_set,
+        scales,
+        start_state=start_state,
+        upper_hint=max(start_metrics["f2"] - e2, start_metrics["f3"] - z1, 1.0),
+        residuals_for_cap=residuals,
+        bisection_steps=bisection_steps,
+        inner_updates=inner_updates,
+        oracle_eval_interval=oracle_eval_interval,
+        condition_check_interval=condition_check_interval,
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+        loader_seed=loader_seed,
+        oracle_name=oracle_name,
+    )
+    return result, cap
+
+
+def _bisect_single_cap(
+    model: CausalCoTTransformer,
+    train_set: SyntheticCoTDataset,
+    scales: TargetScales,
+    *,
+    start_state: dict[str, torch.Tensor],
+    upper_hint: float,
+    residuals_for_cap: Callable[[float], ResidualBuilder],
+    bisection_steps: int,
+    inner_updates: int,
+    oracle_eval_interval: int,
+    condition_check_interval: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device | str,
+    loader_seed: int,
+    oracle_name: str,
+) -> tuple[EMOResult, float]:
+    low = 0.0
+    high = max(float(upper_hint), 1e-8)
+    best: EMOResult | None = None
+    last_result: EMOResult | None = None
+
+    for expansion in range(12):
+        result = _run_switching_oracle(
+            model,
+            train_set,
+            scales,
+            start_state=start_state,
+            residual_builder=residuals_for_cap(high),
+            inner_updates=inner_updates,
+            oracle_eval_interval=oracle_eval_interval,
+            condition_check_interval=condition_check_interval,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            loader_seed=loader_seed,
+            oracle_name=oracle_name,
+            cap=high,
+        )
+        last_result = result
+        if result.feasible:
+            best = result
+            break
+        high *= 2.0
+
+    if best is None:
+        # A failed upper-bracket search is an inner infeasibility result for
+        # the caller.  The final z1 solver uses it to increase its lower
+        # bracket; level 2 turns it into a clear fatal error because E2 is
+        # needed before the final nested problem can start.
+        assert last_result is not None
+        last_result.history.append(
+            {
+                "oracle": oracle_name,
+                "bracket_failed": True,
+                "upper_cap": high / 2.0,
+                "feasible": False,
+            }
+        )
+        return last_result, high / 2.0
+
+    for step in range(bisection_steps):
+        cap = 0.5 * (low + high)
+        result = _run_switching_oracle(
+            model,
+            train_set,
+            scales,
+            start_state=start_state,
+            residual_builder=residuals_for_cap(cap),
+            inner_updates=inner_updates,
+            oracle_eval_interval=oracle_eval_interval,
+            condition_check_interval=condition_check_interval,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            loader_seed=loader_seed,
+            oracle_name=oracle_name,
+            cap=cap,
+        )
+        if result.feasible:
             high = cap
-            best = _checkpoint(model, metrics)
+            best = result
         else:
             low = cap
 
-    if best is None:
-        model.load_state_dict(start_state)
-        metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
-        best = _checkpoint(model, metrics)
-        return EpigraphResult(best["state"], best["metrics"], high, False, history)
-
-    return EpigraphResult(best["state"], best["metrics"], high, True, history)
+    return best, high
 
 
-def select_epigraph_objective(
-    losses: Losses,
+def _run_switching_oracle(
+    model: CausalCoTTransformer,
+    train_set: SyntheticCoTDataset,
+    scales: TargetScales,
     *,
-    constraints: list[Constraint],
-    target_objective: str,
+    start_state: dict[str, torch.Tensor],
+    residual_builder: ResidualBuilder,
+    inner_updates: int,
+    oracle_eval_interval: int,
+    condition_check_interval: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device | str,
+    loader_seed: int,
+    oracle_name: str,
     cap: float,
-) -> tuple[torch.Tensor, str, float]:
-    residual_tensors: list[torch.Tensor] = []
-    objective_tensors: list[torch.Tensor] = []
-    names: list[str] = []
+) -> EMOResult:
+    """Run Eq. (11): update with the objective behind the largest residual."""
 
-    for constraint in constraints:
-        tensor = losses.objective(constraint.objective)
-        residual_tensors.append(tensor - tensor.new_tensor(constraint.threshold))
-        objective_tensors.append(tensor)
-        names.append(constraint.objective)
+    model.load_state_dict(start_state)
+    optimizer = _make_adam(model, lr)
+    batches = _cycle(_loader(train_set, batch_size, loader_seed))
+    history: list[dict[str, Any]] = []
 
-    target_tensor = losses.objective(target_objective)
-    residual_tensors.append(target_tensor - target_tensor.new_tensor(cap))
-    objective_tensors.append(target_tensor)
-    names.append(target_objective)
+    if condition_check_interval <= 0:
+        raise ValueError("condition_check_interval must be positive")
 
-    residual_stack = torch.stack(residual_tensors)
-    active_idx = int(torch.argmax(residual_stack.detach()).item())
-    return objective_tensors[active_idx], names[active_idx], float(residual_stack[active_idx].detach().cpu().item())
+    stopped_early = False
+    for update in range(1, inner_updates + 1):
+        batch = next(batches)
+        losses = _batch_losses(model, batch, scales, device)
+        residuals = residual_builder(losses)
+        values = torch.stack([value for _, value in residuals])
+        active_idx = int(torch.argmax(values.detach()).item())
+        active_name, _ = residuals[active_idx]
+        _adam_step(optimizer, losses.objective(active_name))
+
+        batch_condition = False
+        if update % condition_check_interval == 0:
+            post_losses = _batch_losses(model, batch, scales, device)
+            post_residuals = residual_builder(post_losses)
+            post_values = torch.stack([value for _, value in post_residuals])
+            batch_condition = float(post_values.detach().max().cpu().item()) <= 0.0
+        if batch_condition or (
+            oracle_eval_interval > 0 and _should_eval(update, oracle_eval_interval, inner_updates)
+        ):
+            metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+            full_residuals = _metrics_residuals(metrics, residual_builder)
+            history.append(
+                {
+                    "oracle": oracle_name,
+                    "update": update,
+                    "cap": cap,
+                    "active": active_name,
+                    "max_residual": max(full_residuals.values()),
+                    "feasible": max(full_residuals.values()) <= 0.0,
+                    "batch_condition": batch_condition,
+                    **metrics,
+                }
+            )
+            # The full training-set condition is authoritative. The minibatch
+            # check only decides whether an extra full evaluation is worthwhile.
+            if max(full_residuals.values()) <= 0.0:
+                stopped_early = True
+                break
+
+    metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+    full_residuals = _metrics_residuals(metrics, residual_builder)
+    feasible = max(full_residuals.values()) <= 0.0
+    history.append(
+        {
+            "oracle": oracle_name,
+            "update": inner_updates,
+            "cap": cap,
+            "final": True,
+            "stopped_early": stopped_early,
+            "max_residual": max(full_residuals.values()),
+            "feasible": feasible,
+            **{f"residual_{key}": value for key, value in full_residuals.items()},
+            **metrics,
+        }
+    )
+    last_state = _clone_state(model)
+    return EMOResult(
+        state=last_state,
+        metrics=metrics,
+        feasible=feasible,
+        history=history,
+        last_state=last_state,
+        last_metrics=metrics,
+    )
 
 
-def full_residuals(
-    metrics: dict[str, float],
-    *,
-    constraints: list[Constraint],
-    target_objective: str,
-    cap: float,
-) -> dict[str, float]:
-    residuals = {constraint.objective: metrics[constraint.objective] - constraint.threshold for constraint in constraints}
-    residuals[target_objective] = metrics[target_objective] - cap
-    return residuals
+def _metrics_residuals(metrics: dict[str, float], residual_builder: ResidualBuilder) -> dict[str, float]:
+    # Reuse the exact residual definition with detached scalar tensors so the
+    # feasibility check cannot silently diverge from the minibatch selector.
+    losses = Losses(
+        e1=torch.tensor(metrics["e1"]),
+        e2=torch.tensor(metrics["e2"]),
+        e3=torch.tensor(metrics["e3"]),
+    )
+    return {name: float(value.detach().cpu().item()) for name, value in residual_builder(losses)}
 
 
-def _loader(train_set: SyntheticCoTDataset, batch_size: int) -> DataLoader:
+def _loader(train_set: SyntheticCoTDataset, batch_size: int, seed: int) -> DataLoader:
+    generator = torch.Generator().manual_seed(seed)
     return DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
+        generator=generator,
         collate_fn=collate_teacher_forcing,
     )
 
@@ -229,6 +523,10 @@ def _adam_step(optimizer: torch.optim.Optimizer, objective: torch.Tensor) -> Non
     optimizer.zero_grad(set_to_none=True)
     objective.backward()
     optimizer.step()
+
+
+def _should_eval(update: int, interval: int, total_updates: int) -> bool:
+    return update % interval == 0 or update == total_updates
 
 
 def _checkpoint(model: CausalCoTTransformer, metrics: dict[str, float]) -> dict[str, Any]:

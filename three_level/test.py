@@ -31,7 +31,7 @@ def main() -> None:
     model.load_state_dict(payload[state_key])
 
     scales = TargetScales(**payload["scales"])
-    test_seed = 30_000 + int(cfg["seed"])
+    test_seed = int(cfg.get("test_seed", 30_000))
     test_id = SyntheticCoTDataset(int(cfg["test_size"]), seed=test_seed, sample_demo_count=False, ood=False)
     test_ood = SyntheticCoTDataset(int(cfg["test_size"]), seed=test_seed, sample_demo_count=False, ood=True)
 
@@ -54,4 +54,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
