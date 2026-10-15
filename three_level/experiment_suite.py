@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from .experiment_analysis import generate_analysis
+
 
 BASELINE_METHODS = ("uniform", "staged", "constrained")
 ALL_METHODS = ("uniform", "staged", "constrained", "emo")
@@ -36,6 +38,7 @@ class SuiteConfig:
     uniform_updates: int
     emo_inner_updates: int
     emo_bisection_steps: int
+    emo_backward_budget: int
     quick: bool
     preflight: bool
     overwrite: bool
@@ -70,6 +73,7 @@ def main() -> None:
         uniform_updates=args.uniform_updates,
         emo_inner_updates=args.emo_inner_updates,
         emo_bisection_steps=args.emo_bisection_steps,
+        emo_backward_budget=args.emo_backward_budget,
         quick=args.quick,
         preflight=args.preflight,
         overwrite=args.overwrite,
@@ -89,9 +93,11 @@ def main() -> None:
                 failures.append({"method": method, "seed": seed})
                 if cfg.stop_on_error:
                     summarize_results(run_dir)
+                    generate_analysis(run_dir)
                     raise SystemExit(f"Stopping after failed job: method={method}, seed={seed}")
 
     summarize_results(run_dir)
+    generate_analysis(run_dir)
     if failures:
         raise SystemExit(f"Completed with failed jobs: {failures}")
 
@@ -113,6 +119,8 @@ def run_preflight(cfg: SuiteConfig) -> None:
         ok = run_train_and_eval(method, preflight_cfg.seeds[0], preflight_cfg)
         if not ok:
             raise SystemExit(f"Preflight failed for method={method}. Fix this before a long run.")
+    summarize_results(Path(preflight_cfg.run_dir))
+    generate_analysis(Path(preflight_cfg.run_dir))
 
 
 def run_train_and_eval(method: str, seed: int, cfg: SuiteConfig) -> bool:
@@ -126,16 +134,27 @@ def run_train_and_eval(method: str, seed: int, cfg: SuiteConfig) -> bool:
         append_manifest(run_dir, {"event": "skip_complete", "method": method, "seed": seed, "time": time.time()})
         return True
 
-    append_manifest(run_dir, {"event": "train_start", "method": method, "seed": seed, "time": time.time()})
-    train_command = build_train_command(method, seed, paths.checkpoint, cfg)
-    train_result = run_command(train_command, paths.stdout_log, paths.stderr_log)
-    if train_result["returncode"] != 0:
-        append_manifest(run_dir, {"event": "train_failed", "method": method, "seed": seed, **train_result, "time": time.time()})
-        return False
+    if paths.checkpoint.exists() and not cfg.overwrite:
+        append_manifest(run_dir, {"event": "train_skip_checkpoint", "method": method, "seed": seed, "time": time.time()})
+        if not paths.train_json.exists():
+            atomic_write_json(paths.train_json, checkpoint_summary(paths.checkpoint))
+    else:
+        append_manifest(run_dir, {"event": "train_start", "method": method, "seed": seed, "time": time.time()})
+        train_command = build_train_command(method, seed, paths.checkpoint, cfg)
+        train_result = run_command(train_command, paths.stdout_log, paths.stderr_log)
+        if train_result["returncode"] != 0:
+            append_manifest(
+                run_dir,
+                {"event": "train_failed", "method": method, "seed": seed, **train_result, "time": time.time()},
+            )
+            return False
 
-    train_payload = parse_json_output(paths.stdout_log)
-    atomic_write_json(paths.train_json, train_payload)
-    append_manifest(run_dir, {"event": "train_done", "method": method, "seed": seed, **train_result, "time": time.time()})
+        train_payload = parse_json_output(paths.stdout_log)
+        atomic_write_json(paths.train_json, train_payload)
+        append_manifest(
+            run_dir,
+            {"event": "train_done", "method": method, "seed": seed, **train_result, "time": time.time()},
+        )
 
     for state, output_path in [("selected", paths.selected_eval_json), ("last", paths.last_eval_json)]:
         if output_path.exists() and not cfg.overwrite:
@@ -185,6 +204,8 @@ def build_train_command(method: str, seed: int, checkpoint: Path, cfg: SuiteConf
             str(cfg.emo_inner_updates),
             "--bisection-steps",
             str(cfg.emo_bisection_steps),
+            "--backward-budget",
+            str(cfg.emo_backward_budget),
         ]
     else:
         command = [
@@ -302,6 +323,22 @@ def flatten_metrics(prefix: str, metrics: dict[str, Any]) -> dict[str, Any]:
     return {f"{prefix}.{key}": value for key, value in metrics.items()}
 
 
+def checkpoint_summary(path: Path) -> dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    return {
+        "method": payload.get("method"),
+        "status": payload.get("status", "complete"),
+        "thresholds": payload.get("thresholds", {}),
+        "selected_metrics": payload.get("selected_metrics", {}),
+        "last_metrics": payload.get("last_metrics", {}),
+        "compute": payload.get("compute", {}),
+        "output": str(path),
+    }
+
+
 def job_paths(run_dir: Path, method: str, seed: int) -> JobPaths:
     stem = f"{method}_seed{seed}"
     return JobPaths(
@@ -316,9 +353,25 @@ def job_paths(run_dir: Path, method: str, seed: int) -> JobPaths:
 
 def initialize_run_dir(run_dir: Path, cfg: SuiteConfig) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    for child in ["checkpoints", "eval", "logs", "train"]:
+    for child in ["checkpoints", "eval", "figures", "logs", "tables", "train"]:
         (run_dir / child).mkdir(exist_ok=True)
-    atomic_write_json(run_dir / "suite_config.json", asdict(cfg))
+    config_path = run_dir / "suite_config.json"
+    if config_path.exists():
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+        current = asdict(cfg)
+        ignored = {"methods", "seeds", "preflight", "overwrite", "stop_on_error", "run_dir"}
+        changed = {
+            key: {"existing": existing.get(key), "current": current.get(key)}
+            for key in current
+            if key not in ignored and existing.get(key) != current.get(key)
+        }
+        if changed:
+            raise ValueError(
+                f"Run directory {run_dir} contains incompatible experiment settings: {changed}. "
+                "Use a new --run-dir for the new configuration."
+            )
+        return
+    atomic_write_json(config_path, asdict(cfg))
 
 
 def append_manifest(run_dir: Path, event: dict[str, Any]) -> None:
@@ -351,6 +404,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uniform-updates", type=int, default=4000)
     parser.add_argument("--emo-inner-updates", type=int, default=1500)
     parser.add_argument("--emo-bisection-steps", type=int, default=6)
+    parser.add_argument(
+        "--emo-backward-budget",
+        type=int,
+        default=4000,
+        help="Cumulative EMO backward-call budget; 0 runs the complete EMO algorithm.",
+    )
     parser.add_argument("--quick", action="store_true", help="Use tiny per-method settings for smoke testing.")
     parser.add_argument("--no-preflight", dest="preflight", action="store_false", help="Skip the automatic quick preflight.")
     parser.add_argument("--overwrite", action="store_true", help="Rerun jobs even if checkpoint and eval JSON already exist.")

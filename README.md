@@ -44,13 +44,58 @@ and OOD test prompts.
 
 ## Full Suite
 
-The robust suite runner trains and evaluates every `(method, seed)` as an independent job. It writes
-checkpoints, JSON outputs, logs, an append-only manifest, and flattened summaries under `--run-dir`.
-Completed jobs are skipped on resume unless `--overwrite` is set.
+The robust suite runner trains and evaluates every `(method, seed)` as an independent job. The default
+matrix is four methods by paired seeds `11 22 33`. Baselines use 4,000 backward calls; EMO is stopped
+at the same global backward-call budget for the compute-matched comparison.
 
 ```bash
 python -m three_level.experiment_suite --quick --run-dir runs/suite_smoke
 python -m three_level.experiment_suite --run-dir runs/research_note_suite
 ```
 
+The preflight quick run includes training, selected/last evaluation, aggregation, and plotting before
+the full jobs begin. A resumed suite reuses completed checkpoints and only fills missing evaluations.
+Use `--overwrite` to rerun completed work.
+
+Run EMO to algorithm completion, without the 4,000-call cap, in a separate extension directory:
+
+```bash
+python -m three_level.experiment_suite \
+  --methods emo \
+  --emo-backward-budget 0 \
+  --run-dir runs/emo_complete
+```
+
+Regenerate tables and figures without retraining:
+
+```bash
+python -m three_level.experiment_analysis --run-dir runs/research_note_suite
+```
+
 See `experiments/README.md` for the output layout.
+
+## Estimate Runtime
+
+Before starting the full experiment, run a proportional sample on the same device:
+
+```bash
+conda run -n pytorch_env python -m three_level.time_estimation \
+  --fraction 0.05 \
+  --output-dir runs/time_estimate
+```
+
+The estimator keeps the formal model, batch size, optimizer, losses, bisection depth, and prompt
+lengths. It samples one paired seed and scales only dataset sizes, update counts, evaluation intervals,
+and the EMO backward budget. It estimates the compute-matched main suite and the algorithm-complete
+EMO extension separately. Read `runs/time_estimate/latest_estimate.md` for the concise report and
+`latest_estimate.json` for the full component breakdown. Use `--main-only` to skip the complete-EMO
+sample. A 5% to 10% sample is recommended; very small samples overemphasize startup and warmup costs.
+
+
+python -m three_level.experiment_suite \
+  --run-dir runs/main_budget_4000
+
+pytorch_env python -m three_level.experiment_suite \
+  --methods emo \
+  --emo-backward-budget 0 \
+  --run-dir runs/emo_complete

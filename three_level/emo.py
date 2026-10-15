@@ -8,9 +8,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import SyntheticCoTDataset, TargetScales, collate_teacher_forcing
-from .evaluate import evaluate_teacher_forced
 from .model import CausalCoTTransformer
 from .objectives import Losses, compute_losses
+from .tracking import ComputeTracker, tracked_teacher_forced_evaluation
 
 
 ResidualBuilder = Callable[[Losses], list[tuple[str, torch.Tensor]]]
@@ -28,6 +28,20 @@ class EMOResult:
     last_metrics: dict[str, float]
 
 
+class EMOBudgetExhausted(RuntimeError):
+    def __init__(
+        self,
+        *,
+        state: dict[str, torch.Tensor],
+        metrics: dict[str, float],
+        phase: str,
+    ) -> None:
+        super().__init__(f"EMO backward budget exhausted during {phase}")
+        self.state = state
+        self.metrics = metrics
+        self.phase = phase
+
+
 def minimize_level1(
     model: CausalCoTTransformer,
     train_set: SyntheticCoTDataset,
@@ -39,20 +53,51 @@ def minimize_level1(
     lr: float,
     device: torch.device | str,
     loader_seed: int,
+    tracker: ComputeTracker,
 ) -> EMOResult:
     """Estimate E1 = min_theta f1(theta), as required by the paper."""
 
-    initial = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+    initial = _tracked_eval(
+        model,
+        train_set,
+        scales,
+        tracker=tracker,
+        phase="level1",
+        reason="initial,scheduled,threshold_reference",
+        batch_size=batch_size,
+        device=device,
+        threshold_evaluation=True,
+    )
     best = _checkpoint(model, initial)
     history: list[dict[str, Any]] = [{"oracle": "level1", "update": 0, **initial}]
     optimizer = _make_adam(model, lr)
     batches = _cycle(_loader(train_set, batch_size, loader_seed))
 
     for update in range(1, updates + 1):
-        losses = _batch_losses(model, next(batches), scales, device)
-        _adam_step(optimizer, losses.f1)
+        _check_budget(
+            model,
+            train_set,
+            scales,
+            tracker=tracker,
+            phase="level1",
+            batch_size=batch_size,
+            device=device,
+        )
+        batch = next(batches)
+        losses = _batch_losses(model, batch, scales, device)
+        _adam_step(optimizer, losses.f1, tracker, batch["tokens"].shape[0])
         if _should_eval(update, eval_interval, updates):
-            metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+            metrics = _tracked_eval(
+                model,
+                train_set,
+                scales,
+                tracker=tracker,
+                phase="level1",
+                reason="scheduled,threshold_reference" + (",phase_final" if update == updates else ""),
+                batch_size=batch_size,
+                device=device,
+                threshold_evaluation=True,
+            )
             history.append({"oracle": "level1", "update": update, **metrics})
             if metrics["f1"] < best["metrics"]["f1"]:
                 best = _checkpoint(model, metrics)
@@ -85,6 +130,8 @@ def solve_level2_value(
     lr: float,
     device: torch.device | str,
     loader_seed: int,
+    eval_interval: int,
+    tracker: ComputeTracker,
 ) -> tuple[EMOResult, float]:
     """Recursively estimate E2 using the level-2 epigraph problem.
 
@@ -114,6 +161,8 @@ def solve_level2_value(
         device=device,
         loader_seed=loader_seed,
         oracle_name="level2",
+        eval_interval=eval_interval,
+        tracker=tracker,
     )
     if not result.feasible:
         raise RuntimeError(
@@ -141,6 +190,8 @@ def solve_final_nested(
     lr: float,
     device: torch.device | str,
     loader_seed: int,
+    eval_interval: int,
+    tracker: ComputeTracker,
 ) -> tuple[EMOResult, float, float]:
     """Solve the K=3 final EMO problem with nested z1/z2 bisection.
 
@@ -178,6 +229,8 @@ def solve_final_nested(
             device=device,
             loader_seed=loader_seed,
             oracle_name=f"final_z1_upper_{expansion}",
+            eval_interval=eval_interval,
+            tracker=tracker,
         )
         history.extend(inner_result.history)
         if inner_result.feasible:
@@ -209,6 +262,8 @@ def solve_final_nested(
             device=device,
             loader_seed=loader_seed,
             oracle_name=f"final_z1_{outer_step}",
+            eval_interval=eval_interval,
+            tracker=tracker,
         )
         history.extend(inner_result.history)
         history.append(
@@ -264,6 +319,8 @@ def _solve_inner_z2(
     device: torch.device | str,
     loader_seed: int,
     oracle_name: str,
+    eval_interval: int,
+    tracker: ComputeTracker,
 ) -> tuple[EMOResult, float]:
     def residuals(cap: float) -> ResidualBuilder:
         return lambda losses: [
@@ -272,7 +329,18 @@ def _solve_inner_z2(
             ("f3", losses.f3 - losses.f3.new_tensor(z1 + cap)),
         ]
 
-    start_metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+    model.load_state_dict(start_state)
+    start_metrics = _tracked_eval(
+        model,
+        train_set,
+        scales,
+        tracker=tracker,
+        phase="final",
+        reason="oracle_setup",
+        batch_size=batch_size,
+        device=device,
+        extra={"oracle": oracle_name, "z1": z1},
+    )
     result, cap = _bisect_single_cap(
         model,
         train_set,
@@ -289,6 +357,8 @@ def _solve_inner_z2(
         device=device,
         loader_seed=loader_seed,
         oracle_name=oracle_name,
+        eval_interval=eval_interval,
+        tracker=tracker,
     )
     return result, cap
 
@@ -310,6 +380,8 @@ def _bisect_single_cap(
     device: torch.device | str,
     loader_seed: int,
     oracle_name: str,
+    eval_interval: int,
+    tracker: ComputeTracker,
 ) -> tuple[EMOResult, float]:
     low = 0.0
     high = max(float(upper_hint), 1e-8)
@@ -332,6 +404,8 @@ def _bisect_single_cap(
             loader_seed=loader_seed,
             oracle_name=oracle_name,
             cap=high,
+            eval_interval=eval_interval,
+            tracker=tracker,
         )
         last_result = result
         if result.feasible:
@@ -372,6 +446,8 @@ def _bisect_single_cap(
             loader_seed=loader_seed,
             oracle_name=oracle_name,
             cap=cap,
+            eval_interval=eval_interval,
+            tracker=tracker,
         )
         if result.feasible:
             high = cap
@@ -398,10 +474,22 @@ def _run_switching_oracle(
     loader_seed: int,
     oracle_name: str,
     cap: float,
+    eval_interval: int,
+    tracker: ComputeTracker,
 ) -> EMOResult:
     """Run Eq. (11): update with the objective behind the largest residual."""
 
+    _check_budget(
+        model,
+        train_set,
+        scales,
+        tracker=tracker,
+        phase=oracle_name,
+        batch_size=batch_size,
+        device=device,
+    )
     model.load_state_dict(start_state)
+    tracker.oracle_calls += 1
     optimizer = _make_adam(model, lr)
     batches = _cycle(_loader(train_set, batch_size, loader_seed))
     history: list[dict[str, Any]] = []
@@ -411,24 +499,53 @@ def _run_switching_oracle(
 
     stopped_early = False
     for update in range(1, inner_updates + 1):
+        _check_budget(
+            model,
+            train_set,
+            scales,
+            tracker=tracker,
+            phase=oracle_name,
+            batch_size=batch_size,
+            device=device,
+        )
         batch = next(batches)
         losses = _batch_losses(model, batch, scales, device)
         residuals = residual_builder(losses)
         values = torch.stack([value for _, value in residuals])
         active_idx = int(torch.argmax(values.detach()).item())
         active_name, _ = residuals[active_idx]
-        _adam_step(optimizer, losses.objective(active_name))
+        _adam_step(optimizer, losses.objective(active_name), tracker, batch["tokens"].shape[0])
 
         batch_condition = False
         if update % condition_check_interval == 0:
+            tracker.condition_checks += 1
+            tracker.condition_check_prompts += int(batch["tokens"].shape[0])
             post_losses = _batch_losses(model, batch, scales, device)
             post_residuals = residual_builder(post_losses)
             post_values = torch.stack([value for _, value in post_residuals])
             batch_condition = float(post_values.detach().max().cpu().item()) <= 0.0
-        if batch_condition or (
-            oracle_eval_interval > 0 and _should_eval(update, oracle_eval_interval, inner_updates)
-        ):
-            metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+        scheduled = tracker.backward_calls % eval_interval == 0
+        oracle_scheduled = oracle_eval_interval > 0 and _should_eval(update, oracle_eval_interval, inner_updates)
+        if batch_condition or scheduled or oracle_scheduled:
+            reasons = []
+            if scheduled:
+                reasons.append("scheduled")
+            if batch_condition:
+                reasons.append("feasibility_check")
+            if oracle_scheduled:
+                reasons.append("oracle_interval")
+            metrics = _tracked_eval(
+                model,
+                train_set,
+                scales,
+                tracker=tracker,
+                phase=_oracle_phase(oracle_name),
+                reason=",".join(reasons),
+                batch_size=batch_size,
+                device=device,
+                threshold_evaluation=_oracle_phase(oracle_name) == "level2",
+                extra={"oracle": oracle_name, "cap": cap, "active": active_name},
+            )
             full_residuals = _metrics_residuals(metrics, residual_builder)
             history.append(
                 {
@@ -448,7 +565,20 @@ def _run_switching_oracle(
                 stopped_early = True
                 break
 
-    metrics = evaluate_teacher_forced(model, train_set, scales, batch_size=batch_size, device=device)
+    metrics = _metrics_at_current_call(tracker)
+    if metrics is None:
+        metrics = _tracked_eval(
+            model,
+            train_set,
+            scales,
+            tracker=tracker,
+            phase=_oracle_phase(oracle_name),
+            reason="oracle_final",
+            batch_size=batch_size,
+            device=device,
+            threshold_evaluation=_oracle_phase(oracle_name) == "level2",
+            extra={"oracle": oracle_name, "cap": cap},
+        )
     full_residuals = _metrics_residuals(metrics, residual_builder)
     feasible = max(full_residuals.values()) <= 0.0
     history.append(
@@ -519,10 +649,89 @@ def _make_adam(model: CausalCoTTransformer, lr: float) -> torch.optim.Optimizer:
     return torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
 
 
-def _adam_step(optimizer: torch.optim.Optimizer, objective: torch.Tensor) -> None:
+def _adam_step(
+    optimizer: torch.optim.Optimizer,
+    objective: torch.Tensor,
+    tracker: ComputeTracker,
+    prompts: int,
+) -> None:
     optimizer.zero_grad(set_to_none=True)
     objective.backward()
     optimizer.step()
+    tracker.record_backward(prompts)
+
+
+def _tracked_eval(
+    model: CausalCoTTransformer,
+    train_set: SyntheticCoTDataset,
+    scales: TargetScales,
+    *,
+    tracker: ComputeTracker,
+    phase: str,
+    reason: str,
+    batch_size: int,
+    device: torch.device | str,
+    threshold_evaluation: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    return tracked_teacher_forced_evaluation(
+        model,
+        train_set,
+        scales,
+        tracker=tracker,
+        phase=phase,
+        reason=reason,
+        batch_size=batch_size,
+        device=device,
+        threshold_evaluation=threshold_evaluation,
+        extra=extra,
+    )
+
+
+def _check_budget(
+    model: CausalCoTTransformer,
+    train_set: SyntheticCoTDataset,
+    scales: TargetScales,
+    *,
+    tracker: ComputeTracker,
+    phase: str,
+    batch_size: int,
+    device: torch.device | str,
+) -> None:
+    if tracker.can_step():
+        return
+    metrics = _metrics_at_current_call(tracker)
+    if metrics is None:
+        metrics = _tracked_eval(
+            model,
+            train_set,
+            scales,
+            tracker=tracker,
+            phase=_oracle_phase(phase),
+            reason="budget_exhausted",
+            batch_size=batch_size,
+            device=device,
+            threshold_evaluation=_oracle_phase(phase) in ("level1", "level2"),
+        )
+    raise EMOBudgetExhausted(state=_clone_state(model), metrics=metrics, phase=phase)
+
+
+def _metrics_at_current_call(tracker: ComputeTracker) -> dict[str, float] | None:
+    if not tracker.history or tracker.history[-1].get("backward_calls") != tracker.backward_calls:
+        return None
+    row = tracker.history[-1]
+    keys = ("e1", "e2", "e3", "f1", "f2", "f3")
+    if not all(key in row for key in keys):
+        return None
+    return {key: float(row[key]) for key in keys}
+
+
+def _oracle_phase(oracle_name: str) -> str:
+    if oracle_name == "level1":
+        return "level1"
+    if oracle_name == "level2":
+        return "level2"
+    return "final"
 
 
 def _should_eval(update: int, interval: int, total_updates: int) -> bool:

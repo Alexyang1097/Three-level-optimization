@@ -75,7 +75,10 @@ def evaluate_recursive(
             totals["tf3"] += (tf3 - target3).square().sum(dim=-1).sum().item()
             count += actual
 
-        results[n] = {key: value / count for key, value in totals.items()}
+        averaged = {key: value / count for key, value in totals.items()}
+        for step in (1, 2, 3):
+            averaged[f"delta{step}"] = averaged[f"rec{step}"] - averaged[f"tf{step}"]
+        results[n] = averaged
     return results
 
 
