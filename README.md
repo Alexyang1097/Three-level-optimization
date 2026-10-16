@@ -6,7 +6,7 @@ This repo implements the Section 7 experimental pipeline from the research note:
 - teacher-forced Transformer training with normalized query-only losses
 - recursive test-time prediction for `n in {1, 2, 4, 8, 16, 32}`
 - training methods:
-  - `uniform`: train `f3` for all updates
+  - `uniform`: train the equal-weight mean of step losses (the default cumulative `f3`) for all updates
   - `staged`: train `f1`, then `f2`, then `f3` without constraints
   - `constrained`: recursive constrained stages with adaptive dual weights
   - `emo`: epigraph-based multilevel optimization with bisection over caps
@@ -73,6 +73,18 @@ python -m three_level.experiment_analysis --run-dir runs/research_note_suite
 ```
 
 See `experiments/README.md` for the output layout.
+
+The additional per-step-objective setting uses `f1=e1`, `f2=e2`, `f3=e3` throughout training,
+threshold calibration, and evaluation. It defaults to one seed (`11`) and the three baseline methods,
+excluding EMO, with outputs in `runs/per_step_objectives`:
+
+```bash
+python -m three_level.experiment_suite --objective-family per_step --device cuda
+```
+
+Uniform retains equal-weight joint training; Staged and Primal-Dual optimize the individual step
+objectives. Use `--quick --run-dir runs/per_step_objectives_smoke` for a tiny end-to-end code check.
+The original cumulative setting remains the default. The two settings require separate run directories.
 
 ## Estimate Runtime
 

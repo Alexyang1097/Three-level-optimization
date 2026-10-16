@@ -15,21 +15,39 @@ train/eval step:
 - `tables/dual_history.csv`: Primal-Dual only, one row per dual-vector update (new checkpoints)
 - `tables/dual_feedback_coverage.csv`: per-seed trace coverage, including missing legacy traces
 - `tables/risk_long.csv`: recursive, teacher-forced, and propagation-gap risks
+- `tables/gap_summary.csv`: paired `Rrec - RTF` means, sample standard deviations, and mean absolute
+  seed gaps for every method, selected/last state, distribution, step, and demonstration count
 - `tables/compute.csv`: prompts, backward calls, evaluations, oracle calls, and elapsed time
 - `tables/n32_summary.csv`: seed statistics at `n=32`
 - `tables/n32_compact.csv`: compact selected/last performance, feasibility, and computation table
 - `figures/training_losses.png`: `e1/e2/e3` curves with staged boundaries
+- `figures/training_objectives.png`: active `f1/f2/f3` curves with paired Primal-Dual
+  `b1/b2` reference bounds from their respective activation stages
 - `figures/constraints_and_duals.png`: paired-threshold violations and dual weights
 - `figures/dual_feedback_seed*.png`: per-seed, every-update Primal-Dual feedback, plus a
   `_zoom.png` of 100 updates around the largest absolute multiplier change in the final active
   phase (when that phase has more than 100 updates)
 - `figures/recursive_risks.png`: three-step ID/OOD recursive-risk curves
 - `figures/teacher_forced_risks.png`: matching three-step ID/OOD teacher-forced (RTF) risk curves
+- `figures/recursive_rtf_gap.png`: signed `Rrec - RTF` versus demonstration count, paired by seed
 
 The recursive and RTF figures use selected checkpoints, identical method colors, and a base-2
 demonstration-count axis. Corresponding step/distribution panels share the same y-axis limits for
 direct comparison. Lines show seed means and shaded bands show plus/minus one sample standard
 deviation. Both figures report raw step risks in the original target units.
+
+The gap figure uses selected checkpoints and preserves the zero line and negative differences.
+Its bands are calculated from within-seed differences. Step 1 is equal by definition; its fixed
+display range avoids magnifying floating-point noise. A small signed mean can hide opposite seed
+effects, so `gap_summary.csv` also reports the mean of absolute per-seed gaps. Neither quantity alone
+establishes robustness: interpret it together with RTF and recursive risk.
+
+The training figures use scheduled full-training-pool evaluations, with seed means and plus/minus
+one sample standard deviation. `training_losses.png` diagnoses individual steps; `training_objectives.png`
+shows the active objectives used for staged optimization and constraints. Grey dashed
+bounds in the latter are paired Primal-Dual threshold means with seed-standard-deviation bands;
+use the per-seed residuals in `training_history.csv` to establish feasibility. Stage boundaries apply
+to staged baselines; mixed-method figures explicitly note that EMO has different search phases.
 
 Default methods are:
 
@@ -71,6 +89,64 @@ Regenerate analysis products from existing artifacts:
 ```bash
 conda run -n pytorch_env python -m three_level.experiment_analysis \
   --run-dir runs/research_note_suite
+```
+
+## Per-step objective setting: one seed, three methods
+
+Enable the additional setting with `--objective-family per_step`. Its defaults are methods
+`uniform staged constrained`, seed `11`, and output directory `runs/per_step_objectives`; EMO is
+excluded. The original `cumulative` setting keeps its four-method, three-seed defaults.
+
+Run the new formal setting on a GPU machine:
+
+```bash
+conda run -n pytorch_env python -m three_level.experiment_suite \
+  --objective-family per_step --device cuda
+```
+
+The explicit equivalent is:
+
+```bash
+conda run -n pytorch_env python -m three_level.experiment_suite \
+  --objective-family per_step --methods uniform staged constrained --seeds 11 \
+  --device cuda --run-dir runs/per_step_objectives
+```
+
+All three stages use the new definitions from the start:
+
+| Method | Stage 1 | Stage 2 | Stage 3 / full-run objective |
+|---|---|---|---|
+| Uniform | Joint throughout | Joint throughout | `(e1+e2+e3)/3` |
+| Staged | `f1=e1` | `f2=e2` | `f3=e3` |
+| Primal-Dual | `f1=e1` | `f2=e2`, protect `f1` | `f3=e3`, protect `f1` and `f2` |
+
+The architecture, fixed data/test seeds, normalization, batch size, 1,000/1,500/1,500 staged schedule,
+4,000-call total budget, tolerance, and dual-update parameters retain their existing defaults.
+Primal-Dual calibrates new thresholds from its per-step reference models; it does not reuse the
+old cumulative `b2`. Its every-update dual trace is retained, with `objective_family` recorded.
+
+Model selection follows each method's objective: Uniform selects the lowest measured joint loss;
+Staged selects the lowest measured final objective (`e3` here); Primal-Dual selects the lowest final
+objective among feasible measured candidates. Uniform is deliberately the same joint baseline in
+both settings. Checkpoints and train summaries record `selection_objective` explicitly.
+
+Checkpoint configuration, test evaluation, and exported training/compute tables identify
+`objective_family`. In a per-step run, saved `f1/f2/f3` mean `e1/e2/e3`; in a cumulative run, they
+retain the original prefix averages. Analysis labels the active definitions, computes feasibility
+using those same objectives, and keeps recursive, RTF, gap, and dual-feedback figures. The `e` and
+`f` training panels coincide in the per-step setting. With one seed, there is no across-seed uncertainty
+estimate. Compare raw `e` losses and test risks across settings; a same-named `f2/f3` has different
+meaning in the two settings.
+
+Separate run directories are required. Resume checks both suite configuration and checkpoint
+objective family; analysis rejects mixed families. Legacy artifacts without this field are treated
+as cumulative. The usual automatic quick preflight applies to these three methods only.
+
+For a tiny code check instead of formal training:
+
+```bash
+conda run -n pytorch_env python -m three_level.experiment_suite \
+  --objective-family per_step --quick --run-dir runs/per_step_objectives_smoke
 ```
 
 ## Primal-Dual feedback traces

@@ -8,11 +8,19 @@ from .data import TargetScales
 from .model import gather_query_predictions
 
 
+OBJECTIVE_FAMILIES = ("cumulative", "per_step")
+
+
 @dataclass(frozen=True)
 class Losses:
     e1: torch.Tensor
     e2: torch.Tensor
     e3: torch.Tensor
+    objective_family: str = "cumulative"
+
+    def __post_init__(self) -> None:
+        if self.objective_family not in OBJECTIVE_FAMILIES:
+            raise ValueError(f"Unknown objective family {self.objective_family!r}")
 
     @property
     def f1(self) -> torch.Tensor:
@@ -20,10 +28,19 @@ class Losses:
 
     @property
     def f2(self) -> torch.Tensor:
+        if self.objective_family == "per_step":
+            return self.e2
         return 0.5 * (self.e1 + self.e2)
 
     @property
     def f3(self) -> torch.Tensor:
+        if self.objective_family == "per_step":
+            return self.e3
+        return self.joint
+
+    @property
+    def joint(self) -> torch.Tensor:
+        """Uniform baseline: equal weight on all steps in either setting."""
         return (self.e1 + self.e2 + self.e3) / 3.0
 
     def objective(self, name: str) -> torch.Tensor:
@@ -46,7 +63,10 @@ class Losses:
         }
 
 
-def compute_losses(outputs: torch.Tensor, batch: dict[str, torch.Tensor], scales: TargetScales) -> Losses:
+def compute_losses(
+    outputs: torch.Tensor, batch: dict[str, torch.Tensor], scales: TargetScales, *,
+    objective_family: str = "cumulative",
+) -> Losses:
     p1, p2, p3 = gather_query_predictions(outputs, batch["pred_pos"].to(outputs.device))
     target1 = batch["target1"].to(outputs.device)
     target2 = batch["target2"].to(outputs.device)
@@ -56,5 +76,5 @@ def compute_losses(outputs: torch.Tensor, batch: dict[str, torch.Tensor], scales
     e1 = (p1 - target1).square().sum(dim=-1).mean() / a1
     e2 = (p2 - target2).square().sum(dim=-1).mean() / a2
     e3 = (p3 - target3).square().sum(dim=-1).mean() / a3
-    return Losses(e1=e1, e2=e2, e3=e3)
+    return Losses(e1=e1, e2=e2, e3=e3, objective_family=objective_family)
 

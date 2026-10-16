@@ -85,9 +85,12 @@ def tracked_teacher_forced_evaluation(
     device: torch.device | str,
     threshold_evaluation: bool = False,
     extra: dict[str, Any] | None = None,
+    objective_family: str = "cumulative",
 ) -> dict[str, float]:
     started = synchronized_time(device)
-    metrics = evaluate_teacher_forced(model, dataset, scales, batch_size=batch_size, device=device)
+    metrics = evaluate_teacher_forced(
+        model, dataset, scales, batch_size=batch_size, device=device, objective_family=objective_family,
+    )
     elapsed_sec = synchronized_time(device) - started
     tracker.record_full_evaluation(
         len(dataset),

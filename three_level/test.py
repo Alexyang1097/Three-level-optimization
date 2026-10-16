@@ -49,6 +49,7 @@ def main() -> None:
         scales,
         batch_size=args.batch_size,
         device=device,
+        objective_family=cfg.get("objective_family", "cumulative"),
     )
     recursive_id = evaluate_recursive(model, test_id, batch_size=args.batch_size, device=device)
     recursive_ood = evaluate_recursive(model, test_ood, batch_size=args.batch_size, device=device)
@@ -58,6 +59,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "state": args.state,
         "method": payload.get("method"),
+        "objective_family": cfg.get("objective_family", "cumulative"),
         "status": payload.get("status", "complete"),
         "thresholds": payload.get("thresholds", {}),
         "training_compute": payload.get("compute", {}),

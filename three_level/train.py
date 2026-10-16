@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from .data import SyntheticCoTDataset, TargetScales, collate_teacher_forcing, compute_target_scales
 from .model import CausalCoTTransformer
-from .objectives import Losses, compute_losses
+from .objectives import OBJECTIVE_FAMILIES, Losses, compute_losses
 from .tracking import ComputeTracker, record_metric_snapshot, synchronized_time, tracked_teacher_forced_evaluation
 
 
@@ -39,6 +39,11 @@ class ExperimentConfig:
     dual_nu: float = 0.02
     dual_omega: float = 0.05
     device: str = "cpu"
+    objective_family: str = "cumulative"
+
+    def __post_init__(self) -> None:
+        if self.objective_family not in OBJECTIVE_FAMILIES:
+            raise ValueError(f"Unknown objective family {self.objective_family!r}")
 
 
 @dataclass
@@ -98,8 +103,8 @@ def train_uniform(
     optimizer = _make_adam(model, cfg)
     for update in range(1, cfg.uniform_updates + 1):
         batch = next(state["batches"])
-        losses = _batch_losses(model, batch, scales, cfg.device)
-        _adam_step(optimizer, losses.f3, tracker, batch["tokens"].shape[0])
+        losses = _batch_losses(model, batch, scales, cfg.device, cfg.objective_family)
+        _adam_step(optimizer, losses.joint, tracker, batch["tokens"].shape[0])
         if _should_eval(update, cfg.eval_interval, cfg.uniform_updates):
             last_metrics = _tracked_eval(
                 model,
@@ -110,7 +115,7 @@ def train_uniform(
                 phase="uniform",
                 reason=_eval_reason(update, cfg.uniform_updates),
             )
-            if last_metrics["f3"] < best["metrics"]["f3"]:
+            if _uniform_score(last_metrics, cfg) < _uniform_score(best["metrics"], cfg):
                 best = _checkpoint(model, last_metrics)
 
     return TrainArtifacts(
@@ -146,7 +151,7 @@ def train_staged_unconstrained(
         optimizer = _make_adam(model, cfg)
         for local_update in range(1, updates + 1):
             batch = next(state["batches"])
-            losses = _batch_losses(model, batch, scales, cfg.device)
+            losses = _batch_losses(model, batch, scales, cfg.device, cfg.objective_family)
             _adam_step(optimizer, losses.objective(objective_name), tracker, batch["tokens"].shape[0])
             if _should_eval(local_update, cfg.eval_interval, updates):
                 last_metrics = _tracked_eval(
@@ -200,7 +205,7 @@ def train_staged_constrained(
     optimizer = _make_adam(model, cfg)
     for local_update in range(1, cfg.stage1_updates + 1):
         batch = next(state["batches"])
-        losses = _batch_losses(model, batch, scales, cfg.device)
+        losses = _batch_losses(model, batch, scales, cfg.device, cfg.objective_family)
         _adam_step(optimizer, losses.f1, tracker, batch["tokens"].shape[0])
         if _should_eval(local_update, cfg.eval_interval, cfg.stage1_updates):
             last_metrics = _tracked_eval(
@@ -231,7 +236,7 @@ def train_staged_constrained(
     optimizer = _make_adam(model, cfg)
     for local_update in range(1, cfg.stage2_updates + 1):
         batch = next(state["batches"])
-        losses = _batch_losses(model, batch, scales, cfg.device)
+        losses = _batch_losses(model, batch, scales, cfg.device, cfg.objective_family)
         lambda_before = lambda_stage2
         lambda_stage2 = _dual_update(lambda_stage2, [losses.f1], [b1], cfg)
         _record_dual_feedback(
@@ -271,7 +276,7 @@ def train_staged_constrained(
     optimizer = _make_adam(model, cfg)
     for local_update in range(1, cfg.stage3_updates + 1):
         batch = next(state["batches"])
-        losses = _batch_losses(model, batch, scales, cfg.device)
+        losses = _batch_losses(model, batch, scales, cfg.device, cfg.objective_family)
         lambda_before = lambda_stage3
         lambda_stage3 = _dual_update(lambda_stage3, [losses.f1, losses.f2], [b1, b2], cfg)
         _record_dual_feedback(
@@ -332,6 +337,7 @@ def save_artifacts(path: Path, artifacts: TrainArtifacts, cfg: ExperimentConfig)
         "compute": artifacts.compute,
         "status": artifacts.status,
         "config": asdict(cfg),
+        "selection_objective": "mean(e1,e2,e3)" if artifacts.method == "uniform" else "f3",
     }
     if artifacts.method == "constrained":
         payload["dual_history"] = artifacts.dual_history
@@ -362,10 +368,17 @@ def _batch_losses(
     batch: dict[str, torch.Tensor],
     scales: TargetScales,
     device: torch.device | str,
+    objective_family: str = "cumulative",
 ) -> Losses:
     batch = {key: value.to(device) for key, value in batch.items()}
     outputs = model(batch["tokens"], batch["types"], batch["padding_mask"])
-    return compute_losses(outputs, batch, scales)
+    return compute_losses(outputs, batch, scales, objective_family=objective_family)
+
+
+def _uniform_score(metrics: dict[str, float], cfg: ExperimentConfig) -> float:
+    if cfg.objective_family == "cumulative":
+        return metrics["f3"]
+    return (metrics["e1"] + metrics["e2"] + metrics["e3"]) / 3.0
 
 
 def _dual_update(
@@ -418,6 +431,7 @@ def _record_dual_feedback(
         "dual_reset": local_update == 1,
         "batch_size": int(batch_size),
         "signal_scope": "minibatch",
+        "objective_family": cfg.objective_family,
         "signal_timing": "before_primal_update",
         "dual_nu": cfg.dual_nu,
         "dual_omega": cfg.dual_omega,
@@ -471,6 +485,7 @@ def _tracked_eval(
         device=cfg.device,
         threshold_evaluation=threshold_evaluation,
         extra=extra,
+        objective_family=cfg.objective_family,
     )
 
 
@@ -505,6 +520,7 @@ def _set_seed(seed: int) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train Section 7 three-level synthetic CoT methods.")
     parser.add_argument("--method", choices=["uniform", "staged", "constrained"], default="constrained")
+    parser.add_argument("--objective-family", choices=OBJECTIVE_FAMILIES, default="cumulative")
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--data-seed", type=int, default=10_000)
     parser.add_argument("--test-seed", type=int, default=30_000)
@@ -539,6 +555,7 @@ def main() -> None:
         stage3_updates=args.stage3_updates,
         uniform_updates=args.uniform_updates,
         device=args.device,
+        objective_family=args.objective_family,
     )
     if args.quick:
         cfg.train_size = 96
@@ -557,7 +574,9 @@ def main() -> None:
     elapsed = time.time() - start
     summary = {
         "method": artifacts.method,
+        "objective_family": cfg.objective_family,
         "status": artifacts.status,
+        "selection_objective": "mean(e1,e2,e3)" if artifacts.method == "uniform" else "f3",
         "thresholds": artifacts.thresholds,
         "selected_metrics": artifacts.selected_metrics,
         "last_metrics": artifacts.last_metrics,

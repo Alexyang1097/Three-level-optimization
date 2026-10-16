@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from .experiment_analysis import generate_analysis
+from .objectives import OBJECTIVE_FAMILIES
 
 
 BASELINE_METHODS = ("uniform", "staged", "constrained")
@@ -44,6 +45,28 @@ class SuiteConfig:
     overwrite: bool
     stop_on_error: bool
     emo_warm_start: bool = False
+    objective_family: str = "cumulative"
+
+    def __post_init__(self) -> None:
+        if self.objective_family not in OBJECTIVE_FAMILIES:
+            raise ValueError(f"Unknown objective family {self.objective_family!r}")
+        if self.objective_family == "per_step" and "emo" in self.methods:
+            raise ValueError("The per_step experiment supports uniform, staged, and constrained only; EMO is excluded.")
+
+
+class SuiteArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        result = super().parse_args(args, namespace)
+        per_step = result.objective_family == "per_step"
+        if result.methods is None:
+            result.methods = list(BASELINE_METHODS if per_step else ALL_METHODS)
+        if result.seeds is None:
+            result.seeds = [11] if per_step else list(DEFAULT_SEEDS)
+        if result.run_dir is None:
+            result.run_dir = Path("runs/per_step_objectives" if per_step else "runs/research_note_suite")
+        if per_step and "emo" in result.methods:
+            self.error("--objective-family per_step excludes EMO; choose uniform staged constrained.")
+        return result
 
 
 @dataclass(frozen=True)
@@ -80,6 +103,7 @@ def main() -> None:
         overwrite=args.overwrite,
         stop_on_error=args.stop_on_error,
         emo_warm_start=args.emo_warm_start,
+        objective_family=args.objective_family,
     )
     run_dir = Path(cfg.run_dir)
     initialize_run_dir(run_dir, cfg)
@@ -132,6 +156,14 @@ def run_train_and_eval(method: str, seed: int, cfg: SuiteConfig) -> bool:
     paths.train_json.parent.mkdir(parents=True, exist_ok=True)
     paths.stdout_log.parent.mkdir(parents=True, exist_ok=True)
 
+    if paths.checkpoint.exists() and not cfg.overwrite:
+        saved_family = checkpoint_summary(paths.checkpoint)["objective_family"]
+        if saved_family != cfg.objective_family:
+            raise ValueError(
+                f"Checkpoint {paths.checkpoint} uses objective family {saved_family!r}, "
+                f"requested {cfg.objective_family!r}. Use a new --run-dir."
+            )
+
     if paths.checkpoint.exists() and paths.selected_eval_json.exists() and paths.last_eval_json.exists() and not cfg.overwrite:
         append_manifest(run_dir, {"event": "skip_complete", "method": method, "seed": seed, "time": time.time()})
         return True
@@ -180,6 +212,8 @@ def run_train_and_eval(method: str, seed: int, cfg: SuiteConfig) -> bool:
 
 def build_train_command(method: str, seed: int, checkpoint: Path, cfg: SuiteConfig) -> list[str]:
     if method == "emo":
+        if cfg.objective_family != "cumulative":
+            raise ValueError("EMO is excluded from the per_step experiment")
         command = [
             sys.executable,
             "-m",
@@ -218,6 +252,8 @@ def build_train_command(method: str, seed: int, checkpoint: Path, cfg: SuiteConf
             "three_level.train",
             "--method",
             method,
+            "--objective-family",
+            cfg.objective_family,
             "--seed",
             str(seed),
             "--device",
@@ -300,6 +336,7 @@ def summarize_results(run_dir: Path) -> None:
         method, seed_text = method_seed.rsplit("_seed", 1)
         row = {
             "method": method,
+            "objective_family": payload.get("objective_family", "cumulative"),
             "seed": int(seed_text),
             "state": state,
             **flatten_metrics("teacher_forced_id", payload.get("teacher_forced_id", {})),
@@ -334,6 +371,8 @@ def checkpoint_summary(path: Path) -> dict[str, Any]:
         payload = torch.load(path, map_location="cpu")
     return {
         "method": payload.get("method"),
+        "objective_family": payload.get("config", {}).get("objective_family", "cumulative"),
+        "selection_objective": payload.get("selection_objective", "f3"),
         "status": payload.get("status", "complete"),
         "thresholds": payload.get("thresholds", {}),
         "selected_metrics": payload.get("selected_metrics", {}),
@@ -368,7 +407,7 @@ def initialize_run_dir(run_dir: Path, cfg: SuiteConfig) -> None:
             key: {"existing": existing.get(key), "current": current.get(key)}
             for key in current
             if key not in ignored
-            and existing.get(key, False if key == "emo_warm_start" else None) != current.get(key)
+            and existing.get(key, {"emo_warm_start": False, "objective_family": "cumulative"}.get(key)) != current.get(key)
         }
         if changed:
             raise ValueError(
@@ -393,10 +432,12 @@ def atomic_write_json(path: Path, payload: Any) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the full research-note experiment suite robustly.")
-    parser.add_argument("--run-dir", type=Path, default=Path("runs/research_note_suite"))
-    parser.add_argument("--methods", nargs="+", choices=ALL_METHODS, default=list(ALL_METHODS))
-    parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
+    parser = SuiteArgumentParser(description="Run the research-note or per-step-objective experiment suite.")
+    parser.add_argument("--objective-family", choices=OBJECTIVE_FAMILIES, default="cumulative",
+                        help="per_step defaults to the three baselines, seed 11, and runs/per_step_objectives.")
+    parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--methods", nargs="+", choices=ALL_METHODS)
+    parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--train-size", type=int, default=8192)
     parser.add_argument("--val-size", type=int, default=1024)

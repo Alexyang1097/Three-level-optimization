@@ -34,6 +34,9 @@ def generate_analysis(run_dir: Path, *, make_figures: bool = True) -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     payloads = _load_checkpoints(run_dir / "checkpoints")
+    families = {payload.get("config", {}).get("objective_family", "cumulative") for payload in payloads.values()}
+    if len(families) > 1:
+        raise ValueError("Cannot mix objective families in one analysis; use separate run directories.")
     paired_thresholds = {
         seed: payload.get("thresholds", {})
         for (method, seed), payload in payloads.items()
@@ -43,6 +46,10 @@ def generate_analysis(run_dir: Path, *, make_figures: bool = True) -> None:
     training_rows = _training_rows(payloads, paired_thresholds)
     dual_rows = _dual_rows(payloads)
     risk_rows = _risk_rows(run_dir / "eval")
+    if len({row["objective_family"] for row in risk_rows}) > 1:
+        raise ValueError("Cannot mix objective families in evaluation data; use separate run directories.")
+    if families and any(row["objective_family"] not in families for row in risk_rows):
+        raise ValueError("Evaluation objective family does not match checkpoints; regenerate evaluations in a separate run directory.")
     compute_rows = _compute_rows(payloads, run_dir / "eval")
     n32_rows = _n32_rows(risk_rows)
     compact_rows = _compact_n32_rows(payloads, paired_thresholds, risk_rows, compute_rows)
@@ -51,23 +58,30 @@ def generate_analysis(run_dir: Path, *, make_figures: bool = True) -> None:
     _write_csv(tables_dir / "dual_history.csv", dual_rows)
     _write_csv(tables_dir / "dual_feedback_coverage.csv", _dual_coverage_rows(payloads))
     _write_csv(tables_dir / "risk_long.csv", risk_rows)
+    _write_csv(tables_dir / "gap_summary.csv", _gap_summary_rows(risk_rows))
     _write_csv(tables_dir / "compute.csv", compute_rows)
     _write_csv(tables_dir / "n32_summary.csv", n32_rows)
     _write_csv(tables_dir / "n32_compact.csv", compact_rows)
 
     if make_figures and training_rows:
         _plot_training_losses(training_rows, run_dir, figures_dir)
+        _plot_training_losses(
+            training_rows, run_dir, figures_dir,
+            metrics=("f1", "f2", "f3"), filename="training_objectives.png", show_bounds=True,
+        )
         if any(row.get("constraint1") is not None for row in training_rows):
             _plot_constraints_and_duals(training_rows, figures_dir)
     if make_figures and risk_rows:
         _plot_prediction_risks(risk_rows, figures_dir)
+        _plot_risk_gaps(risk_rows, figures_dir)
     if make_figures and dual_rows:
         _plot_dual_feedback(dual_rows, training_rows, figures_dir)
 
 
 def _dual_rows(payloads: dict[tuple[str, int], dict[str, Any]]) -> list[dict[str, Any]]:
     return [
-        {**item, "method": method, "seed": seed}
+        {**item, "method": method, "seed": seed,
+         "objective_family": payload.get("config", {}).get("objective_family", "cumulative")}
         for (method, seed), payload in sorted(payloads.items())
         if method == "constrained"
         for item in payload.get("dual_history", [])
@@ -86,6 +100,7 @@ def _dual_coverage_rows(payloads: dict[tuple[str, int], dict[str, Any]]) -> list
         complete = all(expected[phase] is not None and counts[phase] == expected[phase] for phase in counts)
         rows.append({
             "method": method, "seed": seed, "recorded_rows": len(history),
+            "objective_family": cfg.get("objective_family", "cumulative"),
             "stage2_rows": counts["stage2"], "stage3_rows": counts["stage3"],
             "expected_stage2_rows": expected["stage2"], "expected_stage3_rows": expected["stage3"],
             "trace_status": "missing" if "dual_history" not in payload else "complete" if complete else "partial",
@@ -109,6 +124,7 @@ def _training_rows(
                 "method": method,
                 "seed": seed,
                 "status": payload.get("status", "complete"),
+                "objective_family": payload.get("config", {}).get("objective_family", "cumulative"),
                 "backward_calls": item.get("backward_calls", item.get("update")),
                 "optimizer_updates": item.get("optimizer_updates", item.get("update")),
                 "training_prompts": item.get("training_prompts"),
@@ -154,6 +170,7 @@ def _risk_rows(eval_dir: Path) -> list[dict[str, Any]]:
                     teacher_forced = float(metrics[f"tf{step}"])
                     base = {
                         "method": method,
+                        "objective_family": payload.get("objective_family", "cumulative"),
                         "seed": int(seed_text),
                         "state": state,
                         "distribution": distribution,
@@ -188,6 +205,7 @@ def _compute_rows(
             {
                 "method": method,
                 "seed": seed,
+                "objective_family": payload.get("config", {}).get("objective_family", "cumulative"),
                 "status": payload.get("status", "complete"),
                 "optimizer_updates": compute.get("optimizer_updates"),
                 "backward_calls": compute.get("backward_calls"),
@@ -207,6 +225,24 @@ def _compute_rows(
             }
         )
     return rows
+
+
+def _gap_summary_rows(risk_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate differences paired within each seed, not independent errors."""
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for row in risk_rows:
+        if row["mode"] == "gap":
+            key = (row["method"], row["state"], row["distribution"], row["step"], row["n"])
+            grouped[key].append(float(row["risk"]))
+    return [
+        {
+            "method": method, "state": state, "distribution": distribution, "step": step, "n": n,
+            "seed_count": len(values), "mean": statistics.fmean(values),
+            "std": statistics.stdev(values) if len(values) > 1 else 0.0,
+            "mean_absolute_seed_gap": statistics.fmean(abs(value) for value in values),
+        }
+        for (method, state, distribution, step, n), values in sorted(grouped.items())
+    ]
 
 
 def _n32_rows(risk_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -247,7 +283,9 @@ def _compact_n32_rows(
     rows: list[dict[str, Any]] = []
     for method in sorted({key[0] for key in payloads}, key=lambda value: list(METHOD_LABELS).index(value)):
         for state in ("selected", "last"):
-            row: dict[str, Any] = {"method": method, "state": state}
+            family = next(payload.get("config", {}).get("objective_family", "cumulative")
+                          for (candidate, _), payload in payloads.items() if candidate == method)
+            row: dict[str, Any] = {"method": method, "state": state, "objective_family": family}
             method_risks = [
                 item
                 for item in risk_rows
@@ -304,7 +342,11 @@ def _compact_n32_rows(
     return rows
 
 
-def _plot_training_losses(rows: list[dict[str, Any]], run_dir: Path, figures_dir: Path) -> None:
+def _plot_training_losses(
+    rows: list[dict[str, Any]], run_dir: Path, figures_dir: Path, *,
+    metrics: tuple[str, ...] = ("e1", "e2", "e3"),
+    filename: str = "training_losses.png", show_bounds: bool = False,
+) -> None:
     plt = _pyplot()
     cfg_path = run_dir / "suite_config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
@@ -335,9 +377,28 @@ def _plot_training_losses(rows: list[dict[str, Any]], run_dir: Path, figures_dir
         if "scheduled" in str(row.get("evaluation_reason", ""))
     ]
     staged_methods_present = any(row["method"] in ("staged", "constrained") for row in rows)
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2), sharex=True)
-    for axis, metric in zip(axes, ("e1", "e2", "e3")):
+    per_step = any(row.get("objective_family") == "per_step" for row in rows)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.8 if show_bounds else 4.2), sharex=True)
+    for axis, metric in zip(axes, metrics):
         _plot_grouped_curves(axis, plot_rows, metric, state_filter=None)
+        bound_key = {"f1": "b1", "f2": "b2"}.get(metric)
+        if show_bounds and bound_key is not None:
+            by_seed = {
+                row["seed"]: float(row[bound_key])
+                for row in rows if row.get(bound_key) is not None
+            }
+            if by_seed and plot_rows:
+                values = list(by_seed.values())
+                mean = statistics.fmean(values)
+                std = statistics.stdev(values) if len(values) > 1 else 0.0
+                start = boundaries[0 if bound_key == "b1" else 1]
+                end = max(float(row["backward_calls"]) for row in plot_rows)
+                axis.plot([start, end], [mean, mean], color="#444444", linestyle="--", linewidth=1.4)
+                axis.fill_between([start, end], mean - std, mean + std, color="#444444", alpha=0.12)
+                axis.annotate(
+                    f"{bound_key} (mean)", xy=(0.98, mean), xycoords=axis.get_yaxis_transform(),
+                    xytext=(0, 5), textcoords="offset points", ha="right", fontsize=8, color="#444444",
+                )
         for boundary in boundaries if staged_methods_present else []:
             axis.axvline(boundary, color="#777777", linestyle="--", linewidth=1, alpha=0.7)
         stage_labels = zip(
@@ -348,15 +409,29 @@ def _plot_training_losses(rows: list[dict[str, Any]], run_dir: Path, figures_dir
             axis.text(x_value, 0.98, label, transform=axis.get_xaxis_transform(), ha="center", va="top", fontsize=8)
         axis.set_title(metric)
         axis.set_xlabel("Cumulative backward calls")
-        axis.set_ylabel("Normalized training loss")
+        axis.set_ylabel(("Normalized per-step objective" if per_step else "Normalized cumulative objective")
+                        if show_bounds else "Normalized training loss")
         axis.grid(alpha=0.2)
     handles, labels = axes[0].get_legend_handles_labels()
     mixed_emo = staged_methods_present and any(row["method"] == "emo" for row in rows)
-    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.045 if mixed_emo else 0), ncol=4, frameon=False)
+    legend_y = (0.09 if mixed_emo else 0.045) if show_bounds else (0.045 if mixed_emo else 0)
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, legend_y), ncol=4, frameon=False)
     if mixed_emo:
         fig.text(0.5, 0.015, "Stage boundaries apply to Staged and Primal-Dual only; EMO has its own search phases.", ha="center", fontsize=8)
-    fig.tight_layout(rect=(0, 0.14 if mixed_emo else 0.09, 1, 1))
-    fig.savefig(figures_dir / "training_losses.png", dpi=180)
+    if show_bounds:
+        fig.text(
+            0.5, 0.06 if mixed_emo else 0.015,
+            "Grey bounds: paired Primal-Dual thresholds, mean +/- seed SD. Mean curves do not establish per-seed feasibility.",
+            ha="center", fontsize=8,
+        )
+    bottom = (0.22 if mixed_emo else 0.17) if show_bounds else (0.14 if mixed_emo else 0.09)
+    if per_step:
+        fig.suptitle("Per-step setting: f1 = e1, f2 = e2, f3 = e3", fontsize=12)
+        if show_bounds:
+            fig.text(0.5, 0.125, "Uniform optimizes mean(e1, e2, e3); staged methods optimize f1, then f2, then f3.",
+                     ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, bottom, 1, 0.93 if per_step else 1))
+    fig.savefig(figures_dir / filename, dpi=180)
     plt.close(fig)
 
 
@@ -534,6 +609,41 @@ def _plot_prediction_risks(rows: list[dict[str, Any]], figures_dir: Path) -> Non
         fig.tight_layout()
         fig.savefig(figures_dir / filename, dpi=180)
         plt.close(fig)
+
+
+def _plot_risk_gaps(rows: list[dict[str, Any]], figures_dir: Path) -> None:
+    plt = _pyplot()
+    fig, axes = plt.subplots(3, 2, figsize=(11, 11), sharex=True)
+    for line, step in enumerate((1, 2, 3)):
+        for col, distribution in enumerate(("id", "ood")):
+            axis = axes[line, col]
+            selected = [
+                row for row in rows
+                if row["state"] == "selected" and row["mode"] == "gap"
+                and row["step"] == step and row["distribution"] == distribution
+            ]
+            _plot_grouped_curves(axis, selected, "risk", state_filter=None, x_key="n")
+            axis.axhline(0, color="#333333", linewidth=1, linestyle="--", alpha=0.7)
+            axis.set_xscale("log", base=2)
+            axis.set_xticks([1, 2, 4, 8, 16, 32], labels=["1", "2", "4", "8", "16", "32"])
+            axis.set_title(f"Step {step} - {distribution.upper()}")
+            axis.set_xlabel("Demonstrations n")
+            axis.set_ylabel("Signed gap: Rrec - RTF (raw risk)")
+            axis.grid(alpha=0.2)
+            if step == 1:
+                # Avoid magnifying floating-point noise into an apparent effect.
+                axis.set_ylim(-0.05, 0.05)
+                axis.text(0.5, 0.9, "Rrec = RTF up to numerical precision", ha="center", transform=axis.transAxes, fontsize=9)
+    axes[0, 0].legend(frameon=False, loc="lower left")
+    fig.suptitle("Recursive minus teacher-forced risk | selected checkpoints", fontsize=13)
+    fig.text(
+        0.5, 0.015,
+        "Differences are paired within each seed; bands show +/- one sample standard deviation.\n"
+        "A smaller gap alone does not imply a lower recursive risk.", ha="center", fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.96))
+    fig.savefig(figures_dir / "recursive_rtf_gap.png", dpi=180)
+    plt.close(fig)
 
 
 def _plot_grouped_curves(

@@ -25,6 +25,7 @@ def evaluate_teacher_forced(
     *,
     batch_size: int,
     device: torch.device | str,
+    objective_family: str = "cumulative",
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = defaultdict(float)
@@ -34,7 +35,7 @@ def evaluate_teacher_forced(
         actual = batch["tokens"].shape[0]
         batch = _move_batch(batch, device)
         outputs = model(batch["tokens"], batch["types"], batch["padding_mask"])
-        losses = compute_losses(outputs, batch, scales).floats()
+        losses = compute_losses(outputs, batch, scales, objective_family=objective_family).floats()
         for key, value in losses.items():
             totals[key] += value * actual
         count += actual
