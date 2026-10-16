@@ -6,7 +6,7 @@ import json
 import os
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +53,7 @@ class TrainArtifacts:
     scales: TargetScales
     compute: dict[str, Any]
     status: str = "complete"
+    dual_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 def run_method(method: str, cfg: ExperimentConfig) -> TrainArtifacts:
@@ -181,6 +182,7 @@ def train_staged_constrained(
     tracker: ComputeTracker,
 ) -> TrainArtifacts:
     state = _new_train_state(model, train_set, cfg)
+    dual_history: list[dict[str, Any]] = []
 
     initial_metrics = _tracked_eval(
         model,
@@ -230,7 +232,13 @@ def train_staged_constrained(
     for local_update in range(1, cfg.stage2_updates + 1):
         batch = next(state["batches"])
         losses = _batch_losses(model, batch, scales, cfg.device)
+        lambda_before = lambda_stage2
         lambda_stage2 = _dual_update(lambda_stage2, [losses.f1], [b1], cfg)
+        _record_dual_feedback(
+            dual_history, lambda_before, lambda_stage2, [losses.f1], [b1], cfg,
+            tracker=tracker, phase="stage2", local_update=local_update,
+            batch_size=batch["tokens"].shape[0],
+        )
         objective = losses.f2 + lambda_stage2[0].detach() * losses.f1
         _adam_step(optimizer, objective, tracker, batch["tokens"].shape[0])
         if _should_eval(local_update, cfg.eval_interval, cfg.stage2_updates):
@@ -264,7 +272,13 @@ def train_staged_constrained(
     for local_update in range(1, cfg.stage3_updates + 1):
         batch = next(state["batches"])
         losses = _batch_losses(model, batch, scales, cfg.device)
+        lambda_before = lambda_stage3
         lambda_stage3 = _dual_update(lambda_stage3, [losses.f1, losses.f2], [b1, b2], cfg)
+        _record_dual_feedback(
+            dual_history, lambda_before, lambda_stage3, [losses.f1, losses.f2], [b1, b2], cfg,
+            tracker=tracker, phase="stage3", local_update=local_update,
+            batch_size=batch["tokens"].shape[0],
+        )
         objective = losses.f3 + lambda_stage3[0].detach() * losses.f1 + lambda_stage3[1].detach() * losses.f2
         _adam_step(optimizer, objective, tracker, batch["tokens"].shape[0])
         if _should_eval(local_update, cfg.eval_interval, cfg.stage3_updates):
@@ -300,6 +314,7 @@ def train_staged_constrained(
         tracker.history,
         scales,
         {},
+        dual_history=dual_history,
     )
 
 
@@ -318,6 +333,8 @@ def save_artifacts(path: Path, artifacts: TrainArtifacts, cfg: ExperimentConfig)
         "status": artifacts.status,
         "config": asdict(cfg),
     }
+    if artifacts.method == "constrained":
+        payload["dual_history"] = artifacts.dual_history
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
@@ -369,6 +386,50 @@ def _dual_update(
         (1.0 - cfg.dual_omega) * lambdas
         + (cfg.dual_omega / cfg.dual_nu) * values
     )
+
+
+@torch.no_grad()
+def _record_dual_feedback(
+    history: list[dict[str, Any]],
+    before: torch.Tensor,
+    after: torch.Tensor,
+    constraints: list[torch.Tensor],
+    thresholds: list[float],
+    cfg: ExperimentConfig,
+    *,
+    tracker: ComputeTracker,
+    phase: str,
+    local_update: int,
+    batch_size: int,
+) -> None:
+    """Observe existing minibatch signals before Adam, without model/oracle work."""
+    f_hat = torch.stack([value.detach() for value in constraints])
+    c_hat = f_hat - f_hat.new_tensor(thresholds)
+    q = c_hat - cfg.dual_nu * before
+    unprojected = (1.0 - cfg.dual_omega) * before + (cfg.dual_omega / cfg.dual_nu) * c_hat
+    # One device transfer per update, with no retained autograd graph.
+    values = torch.stack((f_hat, c_hat, before, q, after, after - before, unprojected)).cpu().tolist()
+    row: dict[str, Any] = {
+        "backward_calls": tracker.backward_calls + 1,
+        "backward_calls_before": tracker.backward_calls,
+        "optimizer_updates": tracker.optimizer_updates + 1,
+        "phase": phase,
+        "local_update": local_update,
+        "dual_reset": local_update == 1,
+        "batch_size": int(batch_size),
+        "signal_scope": "minibatch",
+        "signal_timing": "before_primal_update",
+        "dual_nu": cfg.dual_nu,
+        "dual_omega": cfg.dual_omega,
+    }
+    names = ("f_hat", "c_hat", "lambda_before", "q", "lambda_after", "delta_lambda", "lambda_unprojected")
+    for index, threshold in enumerate(thresholds):
+        suffix = index + 1
+        row[f"b{suffix}"] = threshold
+        for name, vector in zip(names, values):
+            row[f"{name}{suffix}"] = vector[index]
+        row[f"projection_active{suffix}"] = values[-1][index] < 0.0
+    history.append(row)
 
 
 def _make_adam(model: CausalCoTTransformer, cfg: ExperimentConfig) -> torch.optim.Optimizer:

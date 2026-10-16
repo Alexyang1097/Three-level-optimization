@@ -41,21 +41,56 @@ def generate_analysis(run_dir: Path, *, make_figures: bool = True) -> None:
     }
 
     training_rows = _training_rows(payloads, paired_thresholds)
+    dual_rows = _dual_rows(payloads)
     risk_rows = _risk_rows(run_dir / "eval")
     compute_rows = _compute_rows(payloads, run_dir / "eval")
     n32_rows = _n32_rows(risk_rows)
     compact_rows = _compact_n32_rows(payloads, paired_thresholds, risk_rows, compute_rows)
 
     _write_csv(tables_dir / "training_history.csv", training_rows)
+    _write_csv(tables_dir / "dual_history.csv", dual_rows)
+    _write_csv(tables_dir / "dual_feedback_coverage.csv", _dual_coverage_rows(payloads))
     _write_csv(tables_dir / "risk_long.csv", risk_rows)
     _write_csv(tables_dir / "compute.csv", compute_rows)
     _write_csv(tables_dir / "n32_summary.csv", n32_rows)
     _write_csv(tables_dir / "n32_compact.csv", compact_rows)
 
-    if make_figures and training_rows and risk_rows:
+    if make_figures and training_rows:
         _plot_training_losses(training_rows, run_dir, figures_dir)
-        _plot_constraints_and_duals(training_rows, figures_dir)
-        _plot_recursive_risks(risk_rows, figures_dir)
+        if any(row.get("constraint1") is not None for row in training_rows):
+            _plot_constraints_and_duals(training_rows, figures_dir)
+    if make_figures and risk_rows:
+        _plot_prediction_risks(risk_rows, figures_dir)
+    if make_figures and dual_rows:
+        _plot_dual_feedback(dual_rows, training_rows, figures_dir)
+
+
+def _dual_rows(payloads: dict[tuple[str, int], dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {**item, "method": method, "seed": seed}
+        for (method, seed), payload in sorted(payloads.items())
+        if method == "constrained"
+        for item in payload.get("dual_history", [])
+    ]
+
+
+def _dual_coverage_rows(payloads: dict[tuple[str, int], dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for (method, seed), payload in sorted(payloads.items()):
+        if method != "constrained":
+            continue
+        history = payload.get("dual_history", [])
+        cfg = payload.get("config", {})
+        counts = {phase: sum(item["phase"] == phase for item in history) for phase in ("stage2", "stage3")}
+        expected = {phase: cfg.get(f"{phase}_updates") for phase in counts}
+        complete = all(expected[phase] is not None and counts[phase] == expected[phase] for phase in counts)
+        rows.append({
+            "method": method, "seed": seed, "recorded_rows": len(history),
+            "stage2_rows": counts["stage2"], "stage3_rows": counts["stage3"],
+            "expected_stage2_rows": expected["stage2"], "expected_stage3_rows": expected["stage3"],
+            "trace_status": "missing" if "dual_history" not in payload else "complete" if complete else "partial",
+        })
+    return rows
 
 
 def _training_rows(
@@ -80,6 +115,11 @@ def _training_rows(
                 "full_train_evaluations": item.get("full_train_evaluations"),
                 "phase": item.get("phase", item.get("stage", item.get("emo_level", ""))),
                 "evaluation_reason": item.get("evaluation_reason", "legacy"),
+                "oracle": item.get("oracle"),
+                "cap": item.get("cap"),
+                "active": item.get("active"),
+                "warm_start": payload.get("config", {}).get("warm_start", False) if method == "emo" else None,
+                "zero_step_feasible": item.get("zero_step_feasible"),
                 "e1": item["e1"],
                 "e2": item["e2"],
                 "e3": item["e3"],
@@ -294,23 +334,28 @@ def _plot_training_losses(rows: list[dict[str, Any]], run_dir: Path, figures_dir
         for row in rows
         if "scheduled" in str(row.get("evaluation_reason", ""))
     ]
+    staged_methods_present = any(row["method"] in ("staged", "constrained") for row in rows)
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.2), sharex=True)
     for axis, metric in zip(axes, ("e1", "e2", "e3")):
         _plot_grouped_curves(axis, plot_rows, metric, state_filter=None)
-        for boundary in boundaries:
+        for boundary in boundaries if staged_methods_present else []:
             axis.axvline(boundary, color="#777777", linestyle="--", linewidth=1, alpha=0.7)
-        for x_value, label in zip(
+        stage_labels = zip(
             (boundaries[0] / 2, (boundaries[0] + boundaries[1]) / 2, (boundaries[1] + baseline_end) / 2),
             ("Stage 1", "Stage 2", "Stage 3"),
-        ):
+        ) if staged_methods_present else []
+        for x_value, label in stage_labels:
             axis.text(x_value, 0.98, label, transform=axis.get_xaxis_transform(), ha="center", va="top", fontsize=8)
         axis.set_title(metric)
         axis.set_xlabel("Cumulative backward calls")
         axis.set_ylabel("Normalized training loss")
         axis.grid(alpha=0.2)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False)
-    fig.tight_layout(rect=(0, 0.09, 1, 1))
+    mixed_emo = staged_methods_present and any(row["method"] == "emo" for row in rows)
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.045 if mixed_emo else 0), ncol=4, frameon=False)
+    if mixed_emo:
+        fig.text(0.5, 0.015, "Stage boundaries apply to Staged and Primal-Dual only; EMO has its own search phases.", ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.14 if mixed_emo else 0.09, 1, 1))
     fig.savefig(figures_dir / "training_losses.png", dpi=180)
     plt.close(fig)
 
@@ -332,32 +377,163 @@ def _plot_constraints_and_duals(rows: list[dict[str, Any]], figures_dir: Path) -
     plt.close(fig)
 
 
-def _plot_recursive_risks(rows: list[dict[str, Any]], figures_dir: Path) -> None:
+def _plot_dual_feedback(
+    rows: list[dict[str, Any]], training_rows: list[dict[str, Any]], figures_dir: Path,
+) -> None:
+    """Keep every update and each seed; never connect across dual resets."""
     plt = _pyplot()
-    fig, axes = plt.subplots(3, 2, figsize=(11, 11), sharex=True)
-    for row_idx, step in enumerate((1, 2, 3)):
-        for col_idx, distribution in enumerate(("id", "ood")):
-            axis = axes[row_idx, col_idx]
-            selected = [
-                row
-                for row in rows
-                if row["state"] == "selected"
-                and row["mode"] == "recursive"
-                and row["step"] == step
-                and row["distribution"] == distribution
-            ]
-            _plot_grouped_curves(axis, selected, "risk", state_filter=None, x_key="n")
-            axis.set_xscale("log", base=2)
-            axis.set_xticks([1, 2, 4, 8, 16, 32])
-            axis.set_xticklabels(["1", "2", "4", "8", "16", "32"])
-            axis.set_title(f"Step {step} - {distribution.upper()}")
-            axis.set_xlabel("Demonstrations n")
-            axis.set_ylabel("Raw recursive risk")
-            axis.grid(alpha=0.2)
-    axes[0, 0].legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(figures_dir / "recursive_risks.png", dpi=180)
-    plt.close(fig)
+    metrics = (
+        ("c_hat", "Minibatch residual c = f_hat - b", "#2878B5"),
+        ("q", "Dual drive q = c - nu * lambda_before", "#E69F00"),
+        ("delta_lambda", "Projected change in lambda", "#2A9D8F"),
+        ("lambda_after", "Lambda after dual update (before Adam)", "#D1495B"),
+    )
+    for seed in sorted({row["seed"] for row in rows}):
+        seed_rows = sorted((row for row in rows if row["seed"] == seed), key=lambda row: row["backward_calls"])
+        phases = list(dict.fromkeys(row["phase"] for row in seed_rows))
+        windows = [("", seed_rows, "all dual updates")]
+        final_phase_rows = [row for row in seed_rows if row["phase"] == phases[-1]]
+        if len(final_phase_rows) > 100:
+            peak = max(
+                range(len(final_phase_rows)),
+                key=lambda index: max(abs(final_phase_rows[index].get(f"delta_lambda{i}", 0)) for i in (1, 2)),
+            )
+            start = min(max(0, peak - 50), len(final_phase_rows) - 100)
+            windows.append((
+                "_zoom", final_phase_rows[start:start + 100],
+                f"100 updates around largest |delta lambda| in {phases[-1]}",
+            ))
+        full_rows = [row for row in training_rows if row["method"] == "constrained" and row["seed"] == seed]
+        for suffix, window, title in windows:
+            fig, axes = plt.subplots(4, 2, figsize=(14, 12), sharex=True, squeeze=False)
+            xmin = window[0]["backward_calls_before"]
+            xmax = window[-1]["backward_calls"]
+            for col, constraint in enumerate((1, 2)):
+                active_phases = {
+                    row["phase"] for row in window if f"c_hat{constraint}" in row
+                }
+                active_rows = [row for row in window if f"c_hat{constraint}" in row]
+                active_start = active_rows[0]["backward_calls_before"] if active_rows else xmax
+                for line, (metric, ylabel, color) in enumerate(metrics):
+                    axis = axes[line, col]
+                    if active_start > xmin:
+                        axis.axvspan(xmin, active_start, color="#EEEEEE", zorder=0)
+                        if line == 0:
+                            axis.text(
+                                (xmin + active_start) / 2, 0.5, "Not active",
+                                transform=axis.get_xaxis_transform(), ha="center", color="#777777",
+                            )
+                    key = f"{metric}{constraint}"
+                    labeled = False
+                    for phase in phases:
+                        points = [row for row in window if row["phase"] == phase and key in row]
+                        if not points:
+                            continue
+                        axis.plot(
+                            [row["backward_calls"] for row in points], [row[key] for row in points],
+                            color=color, linewidth=0.85, marker=".", markersize=2,
+                            label="Every dual update" if not labeled else None,
+                        )
+                        labeled = True
+                        if metric == "lambda_after" and points[0]["dual_reset"]:
+                            axis.scatter(
+                                [points[0]["backward_calls_before"]], [points[0][f"lambda_before{constraint}"]],
+                                color=color, marker="s", s=24, zorder=4,
+                            )
+                    for row in seed_rows:
+                        boundary = row["backward_calls_before"]
+                        if row["dual_reset"] and row["phase"] in active_phases and xmin <= boundary <= xmax:
+                            axis.axvline(boundary, color="#777777", linestyle="--", linewidth=1)
+                            if line == 0:
+                                axis.text(
+                                    boundary, 0.98, f" {row['phase']}: reset", fontsize=8,
+                                    transform=axis.get_xaxis_transform(), va="top",
+                                )
+                    if metric == "c_hat":
+                        for transition, marker, label in (
+                            (False, "D", "Full train: after Adam"),
+                            (True, "s", "Full train: restored snapshot"),
+                        ):
+                            snapshots = [
+                                row for row in full_rows
+                                if row["phase"] in active_phases and f"constraint{constraint}" in row
+                                and xmin <= row["backward_calls"] <= xmax
+                                and ("stage_transition" in row["evaluation_reason"]) == transition
+                            ]
+                            if snapshots:
+                                axis.scatter(
+                                    [row["backward_calls"] for row in snapshots],
+                                    [row[f"constraint{constraint}"] for row in snapshots],
+                                    marker=marker, s=24, color="#222222", zorder=5, label=label,
+                                )
+                    if labeled:
+                        axis.legend(loc="best", fontsize=7, frameon=False)
+                    else:
+                        axis.text(0.5, 0.5, "Constraint inactive in this window", ha="center", transform=axis.transAxes)
+                    axis.axhline(0, color="#555555", linewidth=0.7, alpha=0.6)
+                    axis.set_ylabel(ylabel, fontsize=9)
+                    axis.set_xlim(xmin, xmax)
+                    axis.grid(alpha=0.18)
+                    if line == 0:
+                        axis.set_title(f"Constraint {constraint}")
+                    if line == 3:
+                        axis.set_xlabel("Cumulative primal update index")
+            fig.suptitle(f"Primal-Dual feedback | seed {seed} | {title}", fontsize=14)
+            fig.text(
+                0.5, 0.015,
+                "Each trace point uses the minibatch BEFORE that Adam update. Black markers are full-pool snapshots.\n"
+                "Dashed lines / square initial lambda markers indicate stage resets; phases are not connected.",
+                ha="center", fontsize=9,
+            )
+            fig.tight_layout(rect=(0, 0.055, 1, 0.97))
+            fig.savefig(figures_dir / f"dual_feedback_seed{seed}{suffix}.png", dpi=180)
+            plt.close(fig)
+
+
+def _plot_prediction_risks(rows: list[dict[str, Any]], figures_dir: Path) -> None:
+    """Plot recursive and teacher-forced risks with matching panel scales."""
+    plt = _pyplot()
+    plots = []
+    for mode, ylabel, filename in (
+        ("recursive", "Raw recursive risk", "recursive_risks.png"),
+        ("teacher_forced", "Raw teacher-forced risk (RTF)", "teacher_forced_risks.png"),
+    ):
+        fig, axes = plt.subplots(3, 2, figsize=(11, 11), sharex=True)
+        for row_idx, step in enumerate((1, 2, 3)):
+            for col_idx, distribution in enumerate(("id", "ood")):
+                axis = axes[row_idx, col_idx]
+                selected = [
+                    row
+                    for row in rows
+                    if row["state"] == "selected"
+                    and row["mode"] == mode
+                    and row["step"] == step
+                    and row["distribution"] == distribution
+                ]
+                _plot_grouped_curves(axis, selected, "risk", state_filter=None, x_key="n")
+                axis.set_xscale("log", base=2)
+                axis.set_xticks([1, 2, 4, 8, 16, 32])
+                axis.set_xticklabels(["1", "2", "4", "8", "16", "32"])
+                axis.set_title(f"Step {step} - {distribution.upper()}")
+                axis.set_xlabel("Demonstrations n")
+                axis.set_ylabel(ylabel)
+                axis.grid(alpha=0.2)
+        axes[0, 0].legend(frameon=False)
+        plots.append((fig, axes, filename))
+
+    # Match each step/distribution across figures, including the seed-variation
+    # bands, so differences cannot be obscured by independent autoscaling.
+    for paired_axes in zip(*(axes.flat for _, axes, _ in plots)):
+        limits = [axis.get_ylim() for axis in paired_axes]
+        bottom = min(low for low, _ in limits)
+        top = max(high for _, high in limits)
+        for axis in paired_axes:
+            axis.set_ylim(bottom, top)
+
+    for fig, _, filename in plots:
+        fig.tight_layout()
+        fig.savefig(figures_dir / filename, dpi=180)
+        plt.close(fig)
 
 
 def _plot_grouped_curves(

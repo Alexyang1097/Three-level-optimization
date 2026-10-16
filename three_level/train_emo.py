@@ -5,14 +5,14 @@ import json
 import os
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from .data import SyntheticCoTDataset, TargetScales, compute_target_scales
-from .emo import EMOBudgetExhausted, minimize_level1, solve_final_nested, solve_level2_value
+from .emo import EMOBudgetExhausted, EMOWarmStart, minimize_level1, solve_final_nested, solve_level2_value
 from .model import CausalCoTTransformer
 from .tracking import ComputeTracker, record_metric_snapshot, synchronized_time
 
@@ -36,6 +36,7 @@ class EMOConfig:
     backward_budget: int = 0
     tolerance: float = 0.02
     device: str = "cpu"
+    warm_start: bool = False
 
 
 @dataclass
@@ -51,6 +52,7 @@ class EMOArtifacts:
     compute: dict[str, Any]
     status: str
     diagnostics: list[dict[str, Any]]
+    selection: dict[str, Any] = field(default_factory=dict)
 
 
 def run_emo(cfg: EMOConfig) -> EMOArtifacts:
@@ -75,6 +77,7 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
     diagnostics: list[dict[str, Any]] = []
     e1: float | None = None
     e2: float | None = None
+    warm_start: EMOWarmStart | None = None
 
     # Use one deterministic minibatch order for every bisection oracle. This
     # makes feasibility comparisons differ primarily because of z, not shuffle noise.
@@ -95,6 +98,9 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
         )
         diagnostics.extend({"emo_level": "level1", **item} for item in level1.history)
         e1 = level1.metrics["f1"]
+        if cfg.warm_start:
+            warm_start = EMOWarmStart("f2", {"f1": e1 + cfg.tolerance})
+            warm_start.observe(model, level1.metrics, tracker)
         record_metric_snapshot(
             tracker,
             level1.metrics,
@@ -121,8 +127,13 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
             loader_seed=loader_seed,
             eval_interval=cfg.eval_interval,
             tracker=tracker,
+            warm_start=warm_start,
         )
         diagnostics.extend({"emo_level": "level2", **item} for item in level2.history)
+        if cfg.warm_start:
+            model.load_state_dict(level2.state)
+            warm_start = EMOWarmStart("f3", {"f1": e1 + cfg.tolerance, "f2": e2 + cfg.tolerance})
+            warm_start.observe(model, level2.metrics, tracker)
         record_metric_snapshot(
             tracker,
             level2.metrics,
@@ -150,9 +161,12 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
             loader_seed=loader_seed,
             eval_interval=cfg.eval_interval,
             tracker=tracker,
+            warm_start=warm_start,
         )
         diagnostics.extend({"emo_level": "final", **item} for item in final.history)
     except EMOBudgetExhausted as exhausted:
+        if warm_start is not None:
+            warm_start.observe(model, exhausted.metrics, tracker)
         tracker.elapsed_train_sec = synchronized_time(device) - started
         thresholds: dict[str, float] = {"epsilon": cfg.tolerance}
         if e1 is not None:
@@ -161,16 +175,21 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
             thresholds["E2_estimate"] = e2
         return EMOArtifacts(
             method="emo",
-            selected_state=exhausted.state,
+            selected_state=warm_start.state if warm_start is not None and warm_start.state is not None else exhausted.state,
             last_state=exhausted.state,
             thresholds=thresholds,
-            selected_metrics=exhausted.metrics,
+            selected_metrics=warm_start.metrics if warm_start is not None and warm_start.metrics is not None else exhausted.metrics,
             last_metrics=exhausted.metrics,
             history=tracker.history,
             scales=scales,
             compute=tracker.summary(),
             status=f"budget_exhausted:{exhausted.phase}",
             diagnostics=diagnostics,
+            selection={
+                "rule": "best_observed_upstream_feasible" if warm_start is not None else "budget_last",
+                "objective": warm_start.objective if warm_start is not None else None,
+                "backward_calls": warm_start.backward_calls if warm_start is not None else tracker.backward_calls,
+            },
         )
 
     model.load_state_dict(final.state)
@@ -180,7 +199,7 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
 
     return EMOArtifacts(
         method="emo",
-        selected_state=final.state,
+        selected_state=warm_start.state if warm_start is not None and warm_start.state is not None else final.state,
         last_state=last_state,
         thresholds={
             "epsilon": cfg.tolerance,
@@ -189,13 +208,18 @@ def run_emo(cfg: EMOConfig) -> EMOArtifacts:
             "z1": z1,
             "z2": z2,
         },
-        selected_metrics=final.metrics,
+        selected_metrics=warm_start.metrics if warm_start is not None and warm_start.metrics is not None else final.metrics,
         last_metrics=last_metrics,
         history=tracker.history,
         scales=scales,
         compute=tracker.summary(),
         status="complete",
         diagnostics=diagnostics,
+        selection={
+            "rule": "best_observed_upstream_feasible" if warm_start is not None else "final_oracle",
+            "objective": warm_start.objective if warm_start is not None else "f3",
+            "backward_calls": warm_start.backward_calls if warm_start is not None else None,
+        },
     )
 
 
@@ -212,6 +236,7 @@ def save_artifacts(path: Path, artifacts: EMOArtifacts, cfg: EMOConfig) -> None:
             "last_metrics": artifacts.last_metrics,
             "history": artifacts.history,
             "diagnostics": artifacts.diagnostics,
+            "selection": artifacts.selection,
             "scales": asdict(artifacts.scales),
             "compute": artifacts.compute,
             "status": artifacts.status,
@@ -267,6 +292,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum cumulative backward calls; 0 runs EMO to algorithm completion.",
     )
     parser.add_argument("--tolerance", type=float, default=0.02)
+    parser.add_argument("--warm-start", action="store_true", help="Reuse observed candidate models across epigraph searches; restart Adam.")
     parser.add_argument("--quick", action="store_true", help="Use tiny sizes and update counts for smoke testing.")
     return parser
 
@@ -290,6 +316,7 @@ def main() -> None:
         backward_budget=args.backward_budget,
         tolerance=args.tolerance,
         device=args.device,
+        warm_start=args.warm_start,
     )
     if args.quick:
         cfg.train_size = 96
@@ -315,6 +342,7 @@ def main() -> None:
                 "selected_metrics": artifacts.selected_metrics,
                 "last_metrics": artifacts.last_metrics,
                 "compute": artifacts.compute,
+                "selection": artifacts.selection,
                 "elapsed_sec": time.time() - start,
                 "output": str(args.output),
             },

@@ -43,6 +43,7 @@ class SuiteConfig:
     preflight: bool
     overwrite: bool
     stop_on_error: bool
+    emo_warm_start: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ def main() -> None:
         preflight=args.preflight,
         overwrite=args.overwrite,
         stop_on_error=args.stop_on_error,
+        emo_warm_start=args.emo_warm_start,
     )
     run_dir = Path(cfg.run_dir)
     initialize_run_dir(run_dir, cfg)
@@ -207,6 +209,8 @@ def build_train_command(method: str, seed: int, checkpoint: Path, cfg: SuiteConf
             "--backward-budget",
             str(cfg.emo_backward_budget),
         ]
+        if cfg.emo_warm_start:
+            command.append("--warm-start")
     else:
         command = [
             sys.executable,
@@ -363,7 +367,8 @@ def initialize_run_dir(run_dir: Path, cfg: SuiteConfig) -> None:
         changed = {
             key: {"existing": existing.get(key), "current": current.get(key)}
             for key in current
-            if key not in ignored and existing.get(key) != current.get(key)
+            if key not in ignored
+            and existing.get(key, False if key == "emo_warm_start" else None) != current.get(key)
         }
         if changed:
             raise ValueError(
@@ -404,6 +409,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uniform-updates", type=int, default=4000)
     parser.add_argument("--emo-inner-updates", type=int, default=1500)
     parser.add_argument("--emo-bisection-steps", type=int, default=6)
+    parser.add_argument("--emo-warm-start", action="store_true", help="Reuse EMO candidate weights across searches; restart Adam.")
     parser.add_argument(
         "--emo-backward-budget",
         type=int,

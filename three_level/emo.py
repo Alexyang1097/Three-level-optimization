@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from .data import SyntheticCoTDataset, TargetScales, collate_teacher_forcing
 from .model import CausalCoTTransformer
 from .objectives import Losses, compute_losses
-from .tracking import ComputeTracker, tracked_teacher_forced_evaluation
+from .tracking import ComputeTracker, record_metric_snapshot, tracked_teacher_forced_evaluation
 
 
 ResidualBuilder = Callable[[Losses], list[tuple[str, torch.Tensor]]]
@@ -26,6 +26,25 @@ class EMOResult:
     history: list[dict[str, Any]]
     last_state: dict[str, torch.Tensor]
     last_metrics: dict[str, float]
+
+
+@dataclass
+class EMOWarmStart:
+    """Best observed model feasible for the current level's original constraints."""
+
+    objective: str
+    bounds: dict[str, float]
+    state: dict[str, torch.Tensor] | None = None
+    metrics: dict[str, float] | None = None
+    backward_calls: int | None = None
+
+    def observe(self, model: CausalCoTTransformer, metrics: dict[str, float], tracker: ComputeTracker) -> None:
+        if any(metrics[name] > bound for name, bound in self.bounds.items()):
+            return
+        if self.metrics is None or metrics[self.objective] < self.metrics[self.objective]:
+            self.state = _clone_state(model)
+            self.metrics = copy.deepcopy(metrics)
+            self.backward_calls = tracker.backward_calls
 
 
 class EMOBudgetExhausted(RuntimeError):
@@ -132,6 +151,7 @@ def solve_level2_value(
     loader_seed: int,
     eval_interval: int,
     tracker: ComputeTracker,
+    warm_start: EMOWarmStart | None = None,
 ) -> tuple[EMOResult, float]:
     """Recursively estimate E2 using the level-2 epigraph problem.
 
@@ -163,6 +183,7 @@ def solve_level2_value(
         oracle_name="level2",
         eval_interval=eval_interval,
         tracker=tracker,
+        warm_start=warm_start,
     )
     if not result.feasible:
         raise RuntimeError(
@@ -192,6 +213,7 @@ def solve_final_nested(
     loader_seed: int,
     eval_interval: int,
     tracker: ComputeTracker,
+    warm_start: EMOWarmStart | None = None,
 ) -> tuple[EMOResult, float, float]:
     """Solve the K=3 final EMO problem with nested z1/z2 bisection.
 
@@ -209,13 +231,14 @@ def solve_final_nested(
     best: EMOResult | None = None
     best_z1 = outer_high
     best_z2 = 0.0
+    outer_start_state = start_state
 
     for expansion in range(12):
         inner_result, inner_z2 = _solve_inner_z2(
             model,
             train_set,
             scales,
-            start_state=start_state,
+            start_state=outer_start_state,
             z1=outer_high,
             e1=e1,
             e2=e2,
@@ -231,8 +254,11 @@ def solve_final_nested(
             oracle_name=f"final_z1_upper_{expansion}",
             eval_interval=eval_interval,
             tracker=tracker,
+            warm_start=warm_start,
         )
         history.extend(inner_result.history)
+        if warm_start is not None:
+            outer_start_state = inner_result.state
         if inner_result.feasible:
             best = inner_result
             best_z1 = outer_high
@@ -248,7 +274,7 @@ def solve_final_nested(
             model,
             train_set,
             scales,
-            start_state=start_state,
+            start_state=outer_start_state,
             z1=z1,
             e1=e1,
             e2=e2,
@@ -264,8 +290,11 @@ def solve_final_nested(
             oracle_name=f"final_z1_{outer_step}",
             eval_interval=eval_interval,
             tracker=tracker,
+            warm_start=warm_start,
         )
         history.extend(inner_result.history)
+        if warm_start is not None:
+            outer_start_state = inner_result.state
         history.append(
             {
                 "oracle": "final_outer",
@@ -321,6 +350,7 @@ def _solve_inner_z2(
     oracle_name: str,
     eval_interval: int,
     tracker: ComputeTracker,
+    warm_start: EMOWarmStart | None = None,
 ) -> tuple[EMOResult, float]:
     def residuals(cap: float) -> ResidualBuilder:
         return lambda losses: [
@@ -359,6 +389,8 @@ def _solve_inner_z2(
         oracle_name=oracle_name,
         eval_interval=eval_interval,
         tracker=tracker,
+        warm_start=warm_start,
+        start_metrics=start_metrics,
     )
     return result, cap
 
@@ -382,31 +414,39 @@ def _bisect_single_cap(
     oracle_name: str,
     eval_interval: int,
     tracker: ComputeTracker,
+    warm_start: EMOWarmStart | None = None,
+    start_metrics: dict[str, float] | None = None,
 ) -> tuple[EMOResult, float]:
     low = 0.0
     high = max(float(upper_hint), 1e-8)
     best: EMOResult | None = None
     last_result: EMOResult | None = None
 
-    for expansion in range(12):
-        result = _run_switching_oracle(
-            model,
-            train_set,
-            scales,
-            start_state=start_state,
-            residual_builder=residuals_for_cap(high),
-            inner_updates=inner_updates,
-            oracle_eval_interval=oracle_eval_interval,
-            condition_check_interval=condition_check_interval,
-            batch_size=batch_size,
-            lr=lr,
-            device=device,
-            loader_seed=loader_seed,
-            oracle_name=oracle_name,
-            cap=high,
-            eval_interval=eval_interval,
-            tracker=tracker,
+    def run(cap: float) -> EMOResult:
+        candidate_state = start_state
+        candidate_metrics = None
+        residual_builder = residuals_for_cap(cap)
+        if warm_start is not None:
+            candidates = [(result.state, result.metrics) for result in (last_result, best) if result is not None]
+            if start_metrics is not None:
+                candidates.append((start_state, start_metrics))
+            if warm_start.state is not None and warm_start.metrics is not None:
+                candidates.append((warm_start.state, warm_start.metrics))
+            if candidates:
+                candidate_state, candidate_metrics = min(
+                    candidates, key=lambda item: _warm_candidate_score(item[1], residual_builder),
+                )
+        return _run_switching_oracle(
+            model, train_set, scales, start_state=candidate_state,
+            residual_builder=residual_builder, inner_updates=inner_updates,
+            oracle_eval_interval=oracle_eval_interval, condition_check_interval=condition_check_interval,
+            batch_size=batch_size, lr=lr, device=device, loader_seed=loader_seed,
+            oracle_name=oracle_name, cap=cap, eval_interval=eval_interval, tracker=tracker,
+            warm_start=warm_start, start_metrics=candidate_metrics,
         )
+
+    for expansion in range(12):
+        result = run(high)
         last_result = result
         if result.feasible:
             best = result
@@ -431,24 +471,8 @@ def _bisect_single_cap(
 
     for step in range(bisection_steps):
         cap = 0.5 * (low + high)
-        result = _run_switching_oracle(
-            model,
-            train_set,
-            scales,
-            start_state=start_state,
-            residual_builder=residuals_for_cap(cap),
-            inner_updates=inner_updates,
-            oracle_eval_interval=oracle_eval_interval,
-            condition_check_interval=condition_check_interval,
-            batch_size=batch_size,
-            lr=lr,
-            device=device,
-            loader_seed=loader_seed,
-            oracle_name=oracle_name,
-            cap=cap,
-            eval_interval=eval_interval,
-            tracker=tracker,
-        )
+        result = run(cap)
+        last_result = result
         if result.feasible:
             high = cap
             best = result
@@ -476,23 +500,49 @@ def _run_switching_oracle(
     cap: float,
     eval_interval: int,
     tracker: ComputeTracker,
+    warm_start: EMOWarmStart | None = None,
+    start_metrics: dict[str, float] | None = None,
 ) -> EMOResult:
     """Run Eq. (11): update with the objective behind the largest residual."""
 
-    _check_budget(
-        model,
-        train_set,
-        scales,
-        tracker=tracker,
-        phase=oracle_name,
-        batch_size=batch_size,
-        device=device,
-    )
+    if warm_start is None:
+        _check_budget(
+            model, train_set, scales, tracker=tracker, phase=oracle_name,
+            batch_size=batch_size, device=device,
+        )
     model.load_state_dict(start_state)
     tracker.oracle_calls += 1
+    history: list[dict[str, Any]] = []
+    candidate = None
+    if warm_start is not None:
+        extra = {"oracle": oracle_name, "cap": cap, "warm_start": True, "optimizer_restarted": True}
+        if start_metrics is None:
+            start_metrics = _tracked_eval(
+                model, train_set, scales, tracker=tracker, phase=_oracle_phase(oracle_name),
+                reason="warm_start_initial", batch_size=batch_size, device=device,
+                threshold_evaluation=_oracle_phase(oracle_name) == "level2", extra=extra,
+            )
+        else:
+            record_metric_snapshot(
+                tracker, start_metrics, phase=_oracle_phase(oracle_name),
+                reason="warm_start_cached", extra=extra,
+            )
+        warm_start.observe(model, start_metrics, tracker)
+        candidate = _checkpoint(model, start_metrics)
+        residuals = _metrics_residuals(start_metrics, residual_builder)
+        feasible = max(residuals.values()) <= 0.0
+        history.append({
+            "oracle": oracle_name, "update": 0, "cap": cap,
+            "warm_start": True, "zero_step_feasible": feasible,
+            "max_residual": max(residuals.values()), "feasible": feasible, **start_metrics,
+        })
+        tracker.history[-1]["zero_step_feasible"] = feasible
+        if feasible:
+            state = candidate["state"]
+            return EMOResult(state, start_metrics, True, history, state, start_metrics)
+
     optimizer = _make_adam(model, lr)
     batches = _cycle(_loader(train_set, batch_size, loader_seed))
-    history: list[dict[str, Any]] = []
 
     if condition_check_interval <= 0:
         raise ValueError("condition_check_interval must be positive")
@@ -547,6 +597,10 @@ def _run_switching_oracle(
                 extra={"oracle": oracle_name, "cap": cap, "active": active_name},
             )
             full_residuals = _metrics_residuals(metrics, residual_builder)
+            if warm_start is not None:
+                warm_start.observe(model, metrics, tracker)
+                if _warm_candidate_score(metrics, residual_builder) < _warm_candidate_score(candidate["metrics"], residual_builder):
+                    candidate = _checkpoint(model, metrics)
             history.append(
                 {
                     "oracle": oracle_name,
@@ -580,6 +634,10 @@ def _run_switching_oracle(
             extra={"oracle": oracle_name, "cap": cap},
         )
     full_residuals = _metrics_residuals(metrics, residual_builder)
+    if warm_start is not None:
+        warm_start.observe(model, metrics, tracker)
+        if _warm_candidate_score(metrics, residual_builder) < _warm_candidate_score(candidate["metrics"], residual_builder):
+            candidate = _checkpoint(model, metrics)
     feasible = max(full_residuals.values()) <= 0.0
     history.append(
         {
@@ -595,14 +653,23 @@ def _run_switching_oracle(
         }
     )
     last_state = _clone_state(model)
+    result_state = candidate["state"] if candidate is not None else last_state
+    result_metrics = candidate["metrics"] if candidate is not None else metrics
+    feasible = max(_metrics_residuals(result_metrics, residual_builder).values()) <= 0.0
     return EMOResult(
-        state=last_state,
-        metrics=metrics,
+        state=result_state,
+        metrics=result_metrics,
         feasible=feasible,
         history=history,
         last_state=last_state,
         last_metrics=metrics,
     )
+
+
+def _warm_candidate_score(metrics: dict[str, float], residual_builder: ResidualBuilder) -> tuple[bool, float, float]:
+    residuals = list(_metrics_residuals(metrics, residual_builder).values())
+    upstream_violation = max(0.0, *residuals[:-1])
+    return upstream_violation > 0.0, upstream_violation, residuals[-1]
 
 
 def _metrics_residuals(metrics: dict[str, float], residual_builder: ResidualBuilder) -> dict[str, float]:
